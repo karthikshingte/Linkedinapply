@@ -1,8 +1,11 @@
 """
 LinkedIn Easy Apply Bot — Selenium automation engine.
 No LinkedIn API required; drives a real Chrome browser session.
+
+Excel file: linkedin_jobs.xlsx  (appended on every run, never overwritten)
 """
 
+import re
 import time
 import random
 import os
@@ -36,8 +39,10 @@ except ImportError:
     EXCEL_OK = False
 
 # ──────────────────────────────────────────────────────────────────────────────
-# URL helpers
+# Constants
 # ──────────────────────────────────────────────────────────────────────────────
+
+EXCEL_FILE = "linkedin_jobs.xlsx"
 
 DATE_FILTER_MAP = {
     "Past 24 hours": "r86400",
@@ -55,107 +60,7 @@ EXPERIENCE_FILTER_MAP = {
     "Any":              "",
 }
 
-
-def _build_search_url(role: str, location: str, date_posted: str, experience: str) -> str:
-    params = [
-        f"keywords={role.replace(' ', '%20')}",
-        f"location={location.replace(' ', '%20')}",
-        "f_LF=f_AL",          # Easy Apply filter
-        "sortBy=DD",          # Most recent first
-    ]
-    date_code = DATE_FILTER_MAP.get(date_posted, "")
-    if date_code:
-        params.append(f"f_TPR={date_code}")
-    exp_code = EXPERIENCE_FILTER_MAP.get(experience, "")
-    if exp_code:
-        params.append(f"f_E={exp_code}")
-    return "https://www.linkedin.com/jobs/search/?" + "&".join(params)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Excel export
-# ──────────────────────────────────────────────────────────────────────────────
-
-HEADER_FILL  = PatternFill("solid", fgColor="1F4E79") if EXCEL_OK else None
-SUCCESS_FILL = PatternFill("solid", fgColor="C6EFCE") if EXCEL_OK else None
-IGNORE_FILL  = PatternFill("solid", fgColor="FFEB9C") if EXCEL_OK else None
-FAIL_FILL    = PatternFill("solid", fgColor="FFC7CE") if EXCEL_OK else None
-
-
-def _make_sheet(wb, title: str, headers: list[str], fill):
-    ws = wb.create_sheet(title)
-    ws.append(headers)
-    for col, _ in enumerate(headers, 1):
-        cell = ws.cell(1, col)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = fill
-        cell.alignment = Alignment(horizontal="center")
-    return ws
-
-
-def _auto_width(ws):
-    for col in ws.columns:
-        max_len = max((len(str(c.value or "")) for c in col), default=0)
-        ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 80)
-
-
-def export_to_excel(applied: list, ignored: list, failed: list, log: Callable) -> str:
-    if not EXCEL_OK:
-        log("[WARN] openpyxl not installed — skipping Excel export. Run: pip install openpyxl")
-        return ""
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"linkedin_jobs_{ts}.xlsx"
-
-    wb = openpyxl.Workbook()
-    wb.remove(wb.active)   # remove default sheet
-
-    # Applied sheet
-    ws_a = _make_sheet(
-        wb, "Applied",
-        ["#", "Job Title", "Company", "URL", "Applied At", "Role Searched"],
-        PatternFill("solid", fgColor="1F4E79"),
-    )
-    for i, j in enumerate(applied, 1):
-        ws_a.append([i, j["title"], j["company"], j["url"], j["timestamp"], j["role"]])
-        for col in range(1, 7):
-            ws_a.cell(i + 1, col).fill = SUCCESS_FILL
-    _auto_width(ws_a)
-
-    # Ignored sheet
-    ws_i = _make_sheet(
-        wb, "Ignored",
-        ["#", "Job Title", "Company", "URL", "Ignored At", "Matched Word"],
-        PatternFill("solid", fgColor="7F6000"),
-    )
-    for i, j in enumerate(ignored, 1):
-        ws_i.append([i, j["title"], j["company"], j["url"], j["timestamp"], j["reason"]])
-        for col in range(1, 7):
-            ws_i.cell(i + 1, col).fill = IGNORE_FILL
-    _auto_width(ws_i)
-
-    # Failed sheet
-    ws_f = _make_sheet(
-        wb, "Failed",
-        ["#", "Job Title", "Company", "URL", "Failed At", "Reason"],
-        PatternFill("solid", fgColor="9C0006"),
-    )
-    for i, j in enumerate(failed, 1):
-        ws_f.append([i, j["title"], j["company"], j["url"], j["timestamp"], j["reason"]])
-        for col in range(1, 7):
-            ws_f.cell(i + 1, col).fill = FAIL_FILL
-    _auto_width(ws_f)
-
-    wb.save(filename)
-    log(f"[INFO] Excel report saved: {os.path.abspath(filename)}")
-    return filename
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Bot
-# ──────────────────────────────────────────────────────────────────────────────
-
-# All selectors to try for job card list items — LinkedIn changes these often
+# All selectors tried in order; LinkedIn changes class names frequently
 CARD_SELECTORS = [
     "li.jobs-search-results__list-item",
     "li[data-occludable-job-id]",
@@ -166,15 +71,176 @@ CARD_SELECTORS = [
     "ul > li.ember-view",
 ]
 
-# Selectors to detect when the page has loaded jobs
 PAGE_READY_SELECTORS = [
     "div.jobs-search-results-list",
     "ul.jobs-search-results__list",
     "div.scaffold-layout__list",
     "div[class*='jobs-search-results']",
-    "div.jobs-search-results__list-item",
 ]
 
+# ──────────────────────────────────────────────────────────────────────────────
+# URL helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_search_url(role: str, location: str, date_posted: str, experience: str) -> str:
+    params = [
+        f"keywords={role.replace(' ', '%20')}",
+        f"location={location.replace(' ', '%20')}",
+        "f_LF=f_AL",
+        "sortBy=DD",
+    ]
+    dc = DATE_FILTER_MAP.get(date_posted, "")
+    if dc:
+        params.append(f"f_TPR={dc}")
+    ec = EXPERIENCE_FILTER_MAP.get(experience, "")
+    if ec:
+        params.append(f"f_E={ec}")
+    return "https://www.linkedin.com/jobs/search/?" + "&".join(params)
+
+
+def _job_id_from_url(url: str) -> str:
+    """Extract the numeric LinkedIn job ID for deduplication."""
+    m = re.search(r"/jobs/view/(\d+)", url)
+    return m.group(1) if m else url.split("?")[0]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Excel — persistent, append-only
+# ──────────────────────────────────────────────────────────────────────────────
+
+SHEET_META = {
+    "Applied": {
+        "headers":     ["#", "Job Title", "Company", "URL", "Date", "Time", "Role Searched"],
+        "hdr_color":   "1F4E79",
+        "row_color":   "C6EFCE",
+    },
+    "Ignored": {
+        "headers":     ["#", "Job Title", "Company", "URL", "Date", "Time", "Reason"],
+        "hdr_color":   "7F6000",
+        "row_color":   "FFEB9C",
+    },
+    "Failed": {
+        "headers":     ["#", "Job Title", "Company", "URL", "Date", "Time", "Reason"],
+        "hdr_color":   "9C0006",
+        "row_color":   "FFC7CE",
+    },
+}
+
+COL_WIDTHS = {
+    "#":            5,
+    "Job Title":    40,
+    "Company":      28,
+    "URL":          55,
+    "Date":         14,
+    "Time":         10,
+    "Role Searched":20,
+    "Reason":       30,
+}
+
+
+def _ensure_sheet(wb, name: str) -> "openpyxl.worksheet.worksheet.Worksheet":
+    meta = SHEET_META[name]
+    if name not in wb.sheetnames:
+        ws = wb.create_sheet(name)
+        ws.append(meta["headers"])
+        hf = PatternFill("solid", fgColor=meta["hdr_color"])
+        for col_idx, h in enumerate(meta["headers"], 1):
+            cell = ws.cell(1, col_idx)
+            cell.font      = Font(bold=True, color="FFFFFF")
+            cell.fill      = hf
+            cell.alignment = Alignment(horizontal="center")
+            ws.column_dimensions[cell.column_letter].width = COL_WIDTHS.get(h, 20)
+    return wb[name]
+
+
+def _load_or_create_workbook() -> "openpyxl.Workbook":
+    if os.path.exists(EXCEL_FILE):
+        try:
+            return openpyxl.load_workbook(EXCEL_FILE)
+        except Exception:
+            pass
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    return wb
+
+
+def load_applied_job_ids(log: Callable) -> set:
+    """
+    Read linkedin_jobs.xlsx and return the set of already-applied LinkedIn job IDs.
+    Called once at bot startup so we never re-apply to a previously applied job.
+    """
+    ids: set[str] = set()
+    if not EXCEL_OK or not os.path.exists(EXCEL_FILE):
+        return ids
+    try:
+        wb = openpyxl.load_workbook(EXCEL_FILE, read_only=True, data_only=True)
+        if "Applied" in wb.sheetnames:
+            ws = wb["Applied"]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                url_cell = row[3] if len(row) > 3 else None
+                if url_cell:
+                    ids.add(_job_id_from_url(str(url_cell)))
+        wb.close()
+        if ids:
+            log(f"[INFO] Loaded {len(ids)} previously applied job ID(s) from Excel — will skip them.")
+    except Exception as e:
+        log(f"[WARN] Could not read existing Excel for dedup: {e}")
+    return ids
+
+
+def update_excel(
+    applied: list[dict],
+    ignored: list[dict],
+    failed:  list[dict],
+    log: Callable,
+) -> None:
+    if not EXCEL_OK:
+        log("[WARN] openpyxl not installed — skipping Excel export. Run: pip install openpyxl")
+        return
+    if not (applied or ignored or failed):
+        log("[INFO] Nothing new to save to Excel.")
+        return
+
+    try:
+        wb = _load_or_create_workbook()
+
+        for sheet_name, jobs in [("Applied", applied), ("Ignored", ignored), ("Failed", failed)]:
+            if not jobs:
+                continue
+            ws    = _ensure_sheet(wb, sheet_name)
+            start = ws.max_row      # 1 = header only → next data row = 2
+            rf    = PatternFill("solid", fgColor=SHEET_META[sheet_name]["row_color"])
+
+            for offset, j in enumerate(jobs):
+                row_num    = start + offset + 1
+                row_index  = row_num - 1          # sequential # ignoring header
+                dt         = datetime.strptime(j["timestamp"], "%Y-%m-%d %H:%M:%S")
+                date_str   = dt.strftime("%Y-%m-%d")
+                time_str   = dt.strftime("%H:%M:%S")
+
+                if sheet_name == "Applied":
+                    values = [row_index, j["title"], j["company"], j["url"],
+                              date_str, time_str, j.get("role", "")]
+                else:
+                    values = [row_index, j["title"], j["company"], j["url"],
+                              date_str, time_str, j.get("reason", "")]
+
+                ws.append(values)
+                for col_idx in range(1, len(values) + 1):
+                    ws.cell(row_num, col_idx).fill = rf
+
+        wb.save(EXCEL_FILE)
+        path = os.path.abspath(EXCEL_FILE)
+        log(f"[INFO] Excel updated: {path}  "
+            f"(+{len(applied)} applied, +{len(ignored)} ignored, +{len(failed)} failed)")
+
+    except Exception as e:
+        log(f"[ERROR] Could not update Excel: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bot
+# ──────────────────────────────────────────────────────────────────────────────
 
 class LinkedInBot:
 
@@ -184,20 +250,23 @@ class LinkedInBot:
         log: Callable[[str], None],
         count_callback: Callable[[int], None] | None = None,
     ):
-        self.config = config
-        self.log = log
+        self.config         = config
+        self.log            = log
         self.count_callback = count_callback
         self.driver: webdriver.Chrome | None = None
-        self.wait: WebDriverWait | None = None
-        self._stop_flag = False
-        self.applied_count = 0
+        self.wait:   WebDriverWait    | None = None
+        self._stop_flag     = False
+        self.applied_count  = 0
 
-        # Job tracking
+        # Per-run job lists
         self.applied_jobs: list[dict] = []
         self.ignored_jobs: list[dict] = []
         self.failed_jobs:  list[dict] = []
 
-    # ─────────────────────────────────────────────────────────────── control
+        # Loaded from Excel before run starts
+        self._applied_ids: set[str] = set()
+
+    # ─────────────────────────────────── control
 
     def request_stop(self):
         self._stop_flag = True
@@ -205,7 +274,7 @@ class LinkedInBot:
     def _should_stop(self) -> bool:
         return self._stop_flag
 
-    # ─────────────────────────────────────────────────────────────── delays
+    # ─────────────────────────────────── delays
 
     def _delay(self, lo: float | None = None, hi: float | None = None):
         lo = lo if lo is not None else float(self.config.get("min_delay", 3))
@@ -213,9 +282,9 @@ class LinkedInBot:
         time.sleep(random.uniform(lo, hi))
 
     def _short(self):
-        time.sleep(random.uniform(0.8, 1.6))
+        time.sleep(random.uniform(0.7, 1.5))
 
-    # ─────────────────────────────────────────────────────────────── browser
+    # ─────────────────────────────────── browser setup
 
     def _setup_driver(self):
         opts = Options()
@@ -231,8 +300,7 @@ class LinkedInBot:
         opts.add_experimental_option("useAutomationExtension", False)
         opts.add_argument(
             "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
 
         if USE_WDM:
@@ -248,7 +316,7 @@ class LinkedInBot:
         self.wait = WebDriverWait(self.driver, 15)
         self.log("[INFO] Browser launched.")
 
-    # ─────────────────────────────────────────────────────────────── login
+    # ─────────────────────────────────── login
 
     def _login(self) -> bool:
         self.log("[INFO] Opening LinkedIn login page...")
@@ -256,8 +324,8 @@ class LinkedInBot:
         self._delay(2, 4)
 
         try:
-            email_field = self.wait.until(EC.presence_of_element_located((By.ID, "username")))
-            self._type_human(email_field, self.config["email"])
+            email_f = self.wait.until(EC.presence_of_element_located((By.ID, "username")))
+            self._type_human(email_f, self.config["email"])
             pw = self.driver.find_element(By.ID, "password")
             self._type_human(pw, self.config["password"])
             self._short()
@@ -292,7 +360,7 @@ class LinkedInBot:
             element.send_keys(ch)
             time.sleep(random.uniform(0.04, 0.13))
 
-    # ─────────────────────────────────────────────────────────────── search
+    # ─────────────────────────────────── search
 
     def _search(self, role: str):
         url = _build_search_url(
@@ -301,37 +369,37 @@ class LinkedInBot:
             self.config.get("date_posted", "Any Time"),
             self.config.get("experience_level", "Any"),
         )
-        self.log(f"[INFO] Searching: {role}  →  {url}")
+        self.log(f"[INFO] Searching: {role}")
         self.driver.get(url)
         self._delay(4, 6)
 
-    # ─────────────────────────────────────────────────────────────── cards
+    # ─────────────────────────────────── card discovery
 
     def _wait_for_page_ready(self):
-        """Wait until any known results container appears."""
         combined = ", ".join(PAGE_READY_SELECTORS)
         try:
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, combined))
             )
         except TimeoutException:
-            self.log("[WARN] Page ready timeout — trying anyway.")
+            self.log("[WARN] Page ready timeout — proceeding anyway.")
 
     def _get_job_cards(self) -> list:
         self._wait_for_page_ready()
-        time.sleep(1.5)   # let JS render the list
+        time.sleep(1.5)
 
         for sel in CARD_SELECTORS:
-            cards = self.driver.find_elements(By.CSS_SELECTOR, sel)
+            cards   = self.driver.find_elements(By.CSS_SELECTOR, sel)
             visible = [c for c in cards if c.is_displayed()]
             if len(visible) > 1:
-                self.log(f"[DEBUG] {len(visible)} cards found ({sel})")
+                self.log(f"[DEBUG] {len(visible)} cards  ({sel})")
                 return visible
 
-        # Last resort: dump page title for debugging
-        self.log(f"[DEBUG] No cards found. Page title: '{self.driver.title}'")
-        self.log(f"[DEBUG] Current URL: {self.driver.current_url}")
+        self.log(f"[DEBUG] No cards found — page title: '{self.driver.title}'")
+        self.log(f"[DEBUG] URL: {self.driver.current_url}")
         return []
+
+    # ─────────────────────────────────── card data extraction
 
     def _get_title(self, card) -> str:
         for sel in [
@@ -379,14 +447,63 @@ class LinkedInBot:
                     return href.split("?")[0]
             except NoSuchElementException:
                 continue
-        return self.driver.current_url
+        return self.driver.current_url.split("?")[0]
 
-    def _should_skip(self, title: str) -> tuple[bool, str]:
+    def _get_detail_text(self) -> str:
+        """Read the job detail panel text after clicking a card."""
+        for sel in [
+            "div.jobs-description",
+            "div.jobs-unified-top-card",
+            "div.job-details-jobs-unified-top-card__job-insight",
+            "div.jobs-details",
+        ]:
+            try:
+                return self.driver.find_element(By.CSS_SELECTOR, sel).text.lower()
+            except NoSuchElementException:
+                continue
+        return ""
+
+    # ─────────────────────────────────── filtering logic
+
+    def _check_ignore(self, title: str) -> tuple[bool, str]:
+        """Returns (should_skip, matched_word)."""
         lower = title.lower()
         for word in self.config.get("ignore_words", []):
             if word.strip().lower() in lower:
                 return True, word
         return False, ""
+
+    def _check_role_match(self, title: str) -> bool:
+        """
+        If strict_role_match is on, skip any job whose title contains none
+        of the keywords derived from the user's job_roles list.
+        Splits each role into words >3 chars and checks any of them.
+        """
+        if not self.config.get("strict_role_match", True):
+            return True
+        title_lower = title.lower()
+        for role in self.config.get("job_roles", []):
+            keywords = [w for w in role.lower().split() if len(w) > 3]
+            if any(kw in title_lower for kw in keywords):
+                return True
+        return False
+
+    def _check_job_type(self, title: str, detail_text: str) -> tuple[bool, str]:
+        """
+        If job_type_keywords list is non-empty, at least one keyword must appear
+        in the title or job detail text.
+        Returns (passes, matched_keyword_or_reason).
+        """
+        required = [k.strip() for k in self.config.get("job_type_keywords", []) if k.strip()]
+        if not required:
+            return True, ""
+        combined = (title + " " + detail_text).lower()
+        for kw in required:
+            if kw.lower() in combined:
+                return True, kw
+        return False, f"none of {required} found"
+
+    # ─────────────────────────────────── apply flow
 
     def _click_card(self, card) -> bool:
         try:
@@ -399,22 +516,19 @@ class LinkedInBot:
             self.log(f"[WARN] Could not click card: {e}")
             return False
 
-    # ─────────────────────────────────────────────────────────────── apply
-
     def _click_easy_apply(self) -> bool:
-        selectors = [
+        for sel in [
             "button.jobs-apply-button",
             "button[aria-label*='Easy Apply']",
             "button[aria-label*='easy apply']",
             ".jobs-s-apply button",
-            ".jobs-apply-button",
-        ]
-        for sel in selectors:
+        ]:
             try:
                 btn = WebDriverWait(self.driver, 6).until(
                     EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
                 )
-                if "easy apply" in (btn.text or btn.get_attribute("aria-label") or "").lower():
+                label = (btn.text or btn.get_attribute("aria-label") or "").lower()
+                if "easy apply" in label:
                     btn.click()
                     self._delay(1.5, 3)
                     return True
@@ -436,7 +550,7 @@ class LinkedInBot:
     def _click_next_or_review(self) -> bool:
         btn = self._find_btn(
             "continue to next step", "next step", "next",
-            "review your application", "review"
+            "review your application", "review",
         )
         if btn and btn.is_enabled():
             try:
@@ -485,35 +599,26 @@ class LinkedInBot:
                 pass
 
     def _handle_form(self) -> tuple[bool, str]:
-        """
-        Navigate multi-step Easy Apply form.
-        Returns (success, failure_reason).
-        """
         for step in range(15):
             if self._should_stop():
                 self._close_modal()
                 self._discard()
                 return False, "stopped by user"
-
             self._delay(1, 2)
-
             if self._click_submit():
                 self._delay(1, 2)
                 self._close_modal()
                 return True, ""
-
             if self._click_next_or_review():
                 continue
-
             self._close_modal()
             self._discard()
-            return False, "no navigation button found at step " + str(step + 1)
-
+            return False, f"no nav button at step {step + 1}"
         self._close_modal()
         self._discard()
         return False, "exceeded max form steps"
 
-    # ─────────────────────────────────────────────────────────────── pagination
+    # ─────────────────────────────────── pagination
 
     def _next_page(self, current: int) -> bool:
         try:
@@ -541,11 +646,10 @@ class LinkedInBot:
                 return
             except Exception:
                 continue
-        # Fallback: scroll the window
         self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 3);")
         self._delay(1.5, 2)
 
-    # ─────────────────────────────────────────────────────────────── main
+    # ─────────────────────────────────── main run
 
     def run(self):
         try:
@@ -553,6 +657,9 @@ class LinkedInBot:
 
             if not self._login():
                 return
+
+            # Load previously applied jobs so we never double-apply
+            self._applied_ids = load_applied_job_ids(self.log)
 
             max_apps = int(self.config.get("max_applications", 50))
             roles    = self.config.get("job_roles", [])
@@ -569,10 +676,10 @@ class LinkedInBot:
                     cards = self._get_job_cards()
 
                     if not cards:
-                        self.log(f"[INFO] No job cards found for '{role}' on page {page}.")
+                        self.log(f"[INFO] No job cards for '{role}' on page {page}.")
                         break
 
-                    seen: set[str] = set()
+                    seen_titles: set[str] = set()
 
                     for idx in range(len(cards)):
                         if self._should_stop() or self.applied_count >= max_apps:
@@ -591,43 +698,75 @@ class LinkedInBot:
                             company = self._get_company(card)
                             url     = self._get_url(card)
                             now     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            job_id  = _job_id_from_url(url)
 
-                            if title in seen:
+                            if title in seen_titles:
                                 continue
-                            seen.add(title)
+                            seen_titles.add(title)
 
-                            skip, matched_word = self._should_skip(title)
-                            if skip:
-                                self.log(f"[SKIP] '{title}' @ {company}  (matched: '{matched_word}')")
+                            # ── Filter 1: already applied ──────────────────
+                            if job_id and job_id in self._applied_ids:
+                                self.log(f"[SKIP] Already applied: {title}")
+                                continue
+
+                            # ── Filter 2: ignore list ──────────────────────
+                            ignored, matched_word = self._check_ignore(title)
+                            if ignored:
+                                self.log(f"[SKIP] Ignored ('{matched_word}'): {title}")
                                 self.ignored_jobs.append({
-                                    "title": title, "company": company,
-                                    "url": url, "timestamp": now,
-                                    "reason": matched_word, "role": role,
+                                    "title": title, "company": company, "url": url,
+                                    "timestamp": now, "reason": f"ignore word: {matched_word}",
+                                    "role": role,
                                 })
                                 continue
 
-                            self.log(f"[INFO] Trying: {title} @ {company}")
+                            # ── Filter 3: strict role match ────────────────
+                            if not self._check_role_match(title):
+                                self.log(f"[SKIP] Off-role: {title}")
+                                self.ignored_jobs.append({
+                                    "title": title, "company": company, "url": url,
+                                    "timestamp": now, "reason": "off-role (no role keyword in title)",
+                                    "role": role,
+                                })
+                                continue
 
+                            self.log(f"[INFO] Checking: {title} @ {company}")
+
+                            # Click to open job detail
                             if not self._click_card(card):
-                                reason = "could not click card"
-                                self.log(f"[WARN] {reason}: {title}")
                                 self.failed_jobs.append({
-                                    "title": title, "company": company,
-                                    "url": url, "timestamp": now,
-                                    "reason": reason, "role": role,
+                                    "title": title, "company": company, "url": url,
+                                    "timestamp": now, "reason": "could not click card", "role": role,
                                 })
                                 continue
 
-                            # URL is more accurate after clicking
-                            url = self.driver.current_url.split("?")[0]
+                            # Accurate URL from address bar
+                            url    = self.driver.current_url.split("?")[0]
+                            job_id = _job_id_from_url(url)
 
+                            # Re-check already-applied with accurate URL
+                            if job_id in self._applied_ids:
+                                self.log(f"[SKIP] Already applied (post-click): {title}")
+                                continue
+
+                            # ── Filter 4: job type keywords ────────────────
+                            detail_text          = self._get_detail_text()
+                            type_ok, type_reason = self._check_job_type(title, detail_text)
+                            if not type_ok:
+                                self.log(f"[SKIP] Job type mismatch ({type_reason}): {title}")
+                                self.ignored_jobs.append({
+                                    "title": title, "company": company, "url": url,
+                                    "timestamp": now, "reason": f"job type: {type_reason}",
+                                    "role": role,
+                                })
+                                continue
+
+                            # ── Easy Apply ─────────────────────────────────
                             if not self._click_easy_apply():
-                                reason = "no Easy Apply button"
-                                self.log(f"[SKIP] {reason}: {title}")
+                                self.log(f"[SKIP] No Easy Apply: {title}")
                                 self.failed_jobs.append({
-                                    "title": title, "company": company,
-                                    "url": url, "timestamp": now,
-                                    "reason": reason, "role": role,
+                                    "title": title, "company": company, "url": url,
+                                    "timestamp": now, "reason": "no Easy Apply button", "role": role,
                                 })
                                 continue
 
@@ -635,10 +774,10 @@ class LinkedInBot:
 
                             if success:
                                 self.applied_count += 1
+                                self._applied_ids.add(job_id)    # prevent re-apply in same session
                                 self.applied_jobs.append({
-                                    "title": title, "company": company,
-                                    "url": url, "timestamp": now,
-                                    "reason": "", "role": role,
+                                    "title": title, "company": company, "url": url,
+                                    "timestamp": now, "reason": "", "role": role,
                                 })
                                 if self.count_callback:
                                     self.count_callback(self.applied_count)
@@ -649,15 +788,14 @@ class LinkedInBot:
                             else:
                                 self.log(f"[WARN] Failed ({fail_reason}): {title}")
                                 self.failed_jobs.append({
-                                    "title": title, "company": company,
-                                    "url": url, "timestamp": now,
-                                    "reason": fail_reason, "role": role,
+                                    "title": title, "company": company, "url": url,
+                                    "timestamp": now, "reason": fail_reason, "role": role,
                                 })
 
                             self._delay()
 
                         except StaleElementReferenceException:
-                            self.log("[WARN] DOM changed mid-loop; refreshing card list.")
+                            self.log("[WARN] DOM changed; refreshing card list.")
                             break
                         except Exception as exc:
                             self.log(f"[ERROR] {exc}")
@@ -677,8 +815,7 @@ class LinkedInBot:
                 f"Failed: {len(self.failed_jobs)}"
             )
 
-            # Export results to Excel
-            export_to_excel(self.applied_jobs, self.ignored_jobs, self.failed_jobs, self.log)
+            update_excel(self.applied_jobs, self.ignored_jobs, self.failed_jobs, self.log)
 
         finally:
             if self.driver:
