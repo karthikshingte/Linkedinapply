@@ -1,0 +1,24 @@
+{
+  "email": "",
+  "password": "",
+  "location": "United States",
+  "job_roles": [
+    "Software Engineer",
+    "Python Developer"
+  ],
+  "ignore_words": [
+    "Senior",
+    "Lead",
+    "Manager",
+    "Director",
+    "Principal"
+  ],
+  "min_delay": 3.0,
+  "max_delay": 7.0,
+  "max_applications": 50,
+  "headless": false,
+  "date_posted": "Past 24 hours",
+  "experience_level": "Any",
+  "job_type_keywords": [],
+  "strict_role_match": true
+}
