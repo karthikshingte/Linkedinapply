@@ -83,11 +83,14 @@ PAGE_READY_SELECTORS = [
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _build_search_url(role: str, location: str, date_posted: str, experience: str) -> str:
+    # Wrap role in quotes → LinkedIn treats it as an exact job-title phrase,
+    # not a general keyword search, giving far more targeted results.
+    quoted = f'%22{role.replace(" ", "%20")}%22'
     params = [
-        f"keywords={role.replace(' ', '%20')}",
+        f"keywords={quoted}",
         f"location={location.replace(' ', '%20')}",
-        "f_LF=f_AL",
-        "sortBy=DD",
+        "f_LF=f_AL",   # Easy Apply only
+        "sortBy=DD",    # most recent first
     ]
     dc = DATE_FILTER_MAP.get(date_posted, "")
     if dc:
@@ -134,6 +137,13 @@ def _clean_job_url(raw_url: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 SHEET_META = {
+    # Pipeline sheet — written at end of collection phase, status updated during apply phase
+    "Collected Jobs": {
+        "headers":   ["#", "Job Title", "Company", "URL", "Role Searched",
+                      "Collected Date", "Collected Time", "Status", "Notes"],
+        "hdr_color": "1A237E",
+        "row_color": "E8EAF6",
+    },
     "Applied": {
         "headers":     ["#", "Job Title", "Company", "URL", "Date", "Time", "Role Searched"],
         "hdr_color":   "1F4E79",
@@ -152,14 +162,18 @@ SHEET_META = {
 }
 
 COL_WIDTHS = {
-    "#":            5,
-    "Job Title":    40,
-    "Company":      28,
-    "URL":          55,
-    "Date":         14,
-    "Time":         10,
-    "Role Searched":20,
-    "Reason":       30,
+    "#":               5,
+    "Job Title":       40,
+    "Company":         28,
+    "URL":             55,
+    "Date":            14,
+    "Collected Date":  14,
+    "Time":            10,
+    "Collected Time":  10,
+    "Role Searched":   22,
+    "Reason":          30,
+    "Status":          16,
+    "Notes":           35,
 }
 
 
@@ -215,6 +229,79 @@ def load_applied_job_ids(log: Callable) -> set:
     except Exception as e:
         log(f"[WARN] Could not read existing Excel for dedup: {e}")
     return ids
+
+
+def save_collected_jobs(jobs: list[dict], log: Callable) -> None:
+    """
+    Write the collected-jobs pipeline to the 'Collected Jobs' sheet.
+    Called at the end of Phase 1.  Existing rows are preserved; new ones appended.
+    Each job dict must have: title, company, url, role, collected_at, status, notes.
+    """
+    if not EXCEL_OK:
+        log("[WARN] openpyxl not installed — cannot save collected jobs.")
+        return
+    if not jobs:
+        return
+    try:
+        wb  = _load_or_create_workbook()
+        ws  = _ensure_sheet(wb, "Collected Jobs")
+        rf  = PatternFill("solid", fgColor=SHEET_META["Collected Jobs"]["row_color"])
+        start = ws.max_row   # 1 = header row only
+
+        for offset, j in enumerate(jobs):
+            row_num   = start + offset + 1
+            row_index = row_num - 1
+            dt        = datetime.strptime(j["collected_at"], "%Y-%m-%d %H:%M:%S")
+            ws.append([
+                row_index,
+                j["title"],
+                j["company"],
+                j["url"],
+                j.get("role", ""),
+                dt.strftime("%Y-%m-%d"),
+                dt.strftime("%H:%M:%S"),
+                j.get("status", "Pending"),
+                j.get("notes", ""),
+            ])
+            for col in range(1, 10):
+                ws.cell(row_num, col).fill = rf
+
+        wb.save(EXCEL_FILE)
+        log(f"[INFO] Collected {len(jobs)} jobs saved → {os.path.abspath(EXCEL_FILE)}")
+    except Exception as e:
+        log(f"[ERROR] Could not save collected jobs: {e}")
+
+
+def update_collected_status(excel_row: int, status: str, notes: str, log: Callable) -> None:
+    """
+    Update a single row in 'Collected Jobs' sheet with a new status and notes.
+    excel_row is 1-based (2 = first data row).
+    Called after each apply attempt in Phase 2 so progress is visible in real time.
+    """
+    if not EXCEL_OK or not os.path.exists(EXCEL_FILE):
+        return
+    # Status = col 8, Notes = col 9
+    STATUS_COL = 8
+    NOTES_COL  = 9
+    STATUS_COLORS = {
+        "Applied":        "C6EFCE",
+        "Failed":         "FFC7CE",
+        "Skipped":        "FFEB9C",
+        "No Easy Apply":  "FCE4EC",
+        "Already Applied":"E0E0E0",
+    }
+    try:
+        wb = openpyxl.load_workbook(EXCEL_FILE)
+        ws = wb["Collected Jobs"]
+        ws.cell(excel_row, STATUS_COL).value = status
+        ws.cell(excel_row, NOTES_COL).value  = notes
+        color = STATUS_COLORS.get(status, "E8EAF6")
+        fill  = PatternFill("solid", fgColor=color)
+        for col in range(1, 10):
+            ws.cell(excel_row, col).fill = fill
+        wb.save(EXCEL_FILE)
+    except Exception as e:
+        log(f"[WARN] Could not update row {excel_row} status: {e}")
 
 
 def update_excel(
@@ -277,15 +364,18 @@ class LinkedInBot:
         self,
         config: dict,
         log: Callable[[str], None],
-        count_callback: Callable[[int], None] | None = None,
+        collect_callback: Callable[[int], None] | None = None,
+        apply_callback:   Callable[[int, int], None] | None = None,
     ):
-        self.config         = config
-        self.log            = log
-        self.count_callback = count_callback
+        self.config           = config
+        self.log              = log
+        self.collect_callback = collect_callback  # (collected_count)
+        self.apply_callback   = apply_callback    # (applied_count, total_jobs)
         self.driver: webdriver.Chrome | None = None
         self.wait:   WebDriverWait    | None = None
-        self._stop_flag     = False
-        self.applied_count  = 0
+        self._stop_flag       = False
+        self.applied_count    = 0
+        self._total_to_apply  = 0   # set at start of Phase 2
 
         # Per-run job lists
         self.applied_jobs: list[dict] = []
@@ -640,6 +730,211 @@ class LinkedInBot:
             except Exception:
                 pass
 
+    # ─────────────────────────────────── form auto-fill
+
+    def _get_label_text(self, element) -> str:
+        """Return the question/label text associated with a form element."""
+        v = (element.get_attribute("aria-label") or "").strip()
+        if v:
+            return v
+        elem_id = element.get_attribute("id") or ""
+        if elem_id:
+            try:
+                return self.driver.find_element(
+                    By.CSS_SELECTOR, f'label[for="{elem_id}"]'
+                ).text.strip()
+            except Exception:
+                pass
+        try:
+            return element.find_element(
+                By.XPATH, "..//label"
+            ).text.strip()
+        except Exception:
+            pass
+        return (element.get_attribute("placeholder") or "").strip()
+
+    def _map_answer(self, label: str, answers: dict) -> str:
+        """Map a question label to a user-configured answer string."""
+        lbl = label.lower()
+        if any(w in lbl for w in ("phone", "mobile", "telephone")):
+            return answers.get("phone", "")
+        if any(w in lbl for w in ("year", "experience", "how long", "how many")):
+            return str(answers.get("years_experience", "2"))
+        if any(w in lbl for w in ("annual salary", "salary", "compensation", "ctc")):
+            return str(answers.get("expected_salary", ""))
+        if any(w in lbl for w in ("rate", "hourly", "per hour")):
+            return str(answers.get("expected_rate", ""))
+        if any(w in lbl for w in ("city", "current city")):
+            return answers.get("city", "")
+        if any(w in lbl for w in ("state", "province")):
+            return answers.get("state", "")
+        if any(w in lbl for w in ("zip", "postal")):
+            return answers.get("zip_code", "")
+        if "country" in lbl:
+            return answers.get("country", "United States")
+        if any(w in lbl for w in ("linkedin url", "linkedin profile", "linkedin.com")):
+            return answers.get("linkedin_url", "")
+        if any(w in lbl for w in ("github", "portfolio", "website", "personal site")):
+            return answers.get("portfolio_url", "")
+        return ""
+
+    def _fill_text_inputs(self, answers: dict):
+        try:
+            inputs = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "input[type='text'], input[type='number'], input[type='tel'], input[type='email']",
+            )
+            for inp in inputs:
+                if not inp.is_displayed() or not inp.is_enabled():
+                    continue
+                current = (inp.get_attribute("value") or "").strip()
+                if current and current not in ("0",):
+                    continue  # already filled
+                label = self._get_label_text(inp)
+                value = self._map_answer(label, answers)
+                if value:
+                    inp.clear()
+                    inp.send_keys(value)
+                    self._short()
+        except Exception:
+            pass
+
+    def _select_best_option(self, sel_obj, target: str):
+        """Pick the select option whose text best matches target."""
+        if not target:
+            return
+        t = target.lower()
+        try:
+            for opt in sel_obj.options:
+                if opt.text.strip().lower() == t:
+                    sel_obj.select_by_visible_text(opt.text)
+                    return
+            for opt in sel_obj.options:
+                if t in opt.text.strip().lower():
+                    sel_obj.select_by_visible_text(opt.text)
+                    return
+            for opt in sel_obj.options:
+                ot = opt.text.strip().lower()
+                if ot and ot in t:
+                    sel_obj.select_by_visible_text(opt.text)
+                    return
+        except Exception:
+            pass
+
+    def _fill_selects(self, answers: dict):
+        from selenium.webdriver.support.ui import Select as SeleniumSelect
+        try:
+            for sel_el in self.driver.find_elements(By.TAG_NAME, "select"):
+                if not sel_el.is_displayed() or not sel_el.is_enabled():
+                    continue
+                s = SeleniumSelect(sel_el)
+                current = s.first_selected_option.text.strip().lower()
+                if current not in ("select an option", "please select", "", "select", "-",
+                                   "-- select --", "choose an option"):
+                    continue  # already has a selection
+                lbl = self._get_label_text(sel_el).lower()
+                if any(w in lbl for w in ("education", "degree", "qualification")):
+                    self._select_best_option(s, answers.get("education_level", "Bachelor's Degree"))
+                elif "country" in lbl:
+                    self._select_best_option(s, answers.get("country", "United States"))
+                elif any(w in lbl for w in ("state", "province")):
+                    self._select_best_option(s, answers.get("state", ""))
+                elif any(w in lbl for w in ("experience level", "seniority")):
+                    self._select_best_option(s, answers.get("exp_level_label", "Entry level"))
+                elif any(w in lbl for w in ("employment type", "job type", "work type")):
+                    self._select_best_option(s, answers.get("work_type", "Full-time"))
+                else:
+                    # Default: pick first non-empty option
+                    try:
+                        for opt in s.options[1:]:
+                            if opt.text.strip():
+                                s.select_by_visible_text(opt.text)
+                                break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _fill_radio_groups(self, answers: dict):
+        try:
+            for fs in self.driver.find_elements(By.TAG_NAME, "fieldset"):
+                if not fs.is_displayed():
+                    continue
+                radios = fs.find_elements(By.CSS_SELECTOR, "input[type='radio']")
+                if not radios or any(r.is_selected() for r in radios):
+                    continue
+                question = ""
+                try:
+                    question = fs.find_element(By.TAG_NAME, "legend").text.lower()
+                except Exception:
+                    pass
+                if any(w in question for w in ("authorized", "eligible", "legally", "work in")):
+                    target = answers.get("authorized_to_work", "Yes")
+                elif any(w in question for w in ("sponsor", "sponsorship", "visa")):
+                    target = answers.get("require_sponsorship", "No")
+                elif any(w in question for w in ("relocat", "willing to move")):
+                    target = answers.get("willing_to_relocate", "No")
+                elif any(w in question for w in ("remote", "hybrid", "on-site", "work mode", "work location")):
+                    target = answers.get("work_preference", "Remote")
+                else:
+                    target = answers.get("default_yes_no", "Yes")
+                clicked = False
+                for radio in radios:
+                    try:
+                        rid = radio.get_attribute("id") or ""
+                        rlabel = ""
+                        if rid:
+                            try:
+                                rlabel = self.driver.find_element(
+                                    By.CSS_SELECTOR, f'label[for="{rid}"]'
+                                ).text.strip()
+                            except Exception:
+                                pass
+                        if not rlabel:
+                            rlabel = radio.get_attribute("value") or ""
+                        if target.lower() in rlabel.lower():
+                            self.driver.execute_script("arguments[0].click();", radio)
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not clicked:
+                    try:
+                        self.driver.execute_script("arguments[0].click();", radios[0])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _fill_textareas(self, answers: dict):
+        cover = answers.get("cover_letter", "").strip()
+        if not cover:
+            return
+        try:
+            for ta in self.driver.find_elements(By.TAG_NAME, "textarea"):
+                if not ta.is_displayed() or not ta.is_enabled():
+                    continue
+                if (ta.get_attribute("value") or ta.text or "").strip():
+                    continue
+                lbl = self._get_label_text(ta).lower()
+                if any(w in lbl for w in ("cover", "letter", "summary", "about", "message", "additional")):
+                    ta.clear()
+                    ta.send_keys(cover)
+                    self._short()
+        except Exception:
+            pass
+
+    def _fill_form_fields(self):
+        """Fill any empty required fields on the current form step."""
+        answers = self.config.get("form_answers", {})
+        try:
+            self._fill_text_inputs(answers)
+            self._fill_selects(answers)
+            self._fill_radio_groups(answers)
+            self._fill_textareas(answers)
+        except Exception as e:
+            self.log(f"[WARN] Form fill error (non-fatal): {e}")
+
     def _handle_form(self) -> tuple[bool, str]:
         for step in range(15):
             if self._should_stop():
@@ -647,6 +942,9 @@ class LinkedInBot:
                 self._discard()
                 return False, "stopped by user"
             self._delay(1, 2)
+            # Fill any empty fields on this step before navigating
+            self._fill_form_fields()
+            self._short()
             if self._click_submit():
                 self._delay(1, 2)
                 self._close_modal()
@@ -691,175 +989,230 @@ class LinkedInBot:
         self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 3);")
         self._delay(1.5, 2)
 
+    # ─────────────────────────────────── Phase 1 — collect
+
+    def _collect_phase(self) -> list[dict]:
+        """
+        Fast collection pass — only reads job card metadata (title, company, URL).
+        Never clicks into a job detail page.
+        Applies: already-applied check, ignore list, strict role match.
+        Job-type keyword check is deferred to Phase 2 (needs the detail page).
+        Returns a list of job dicts with status='Pending'.
+        """
+        collected: list[dict] = []
+        seen_ids:  set[str]   = set()
+        roles = self.config.get("job_roles", [])
+
+        for role in roles:
+            if self._should_stop():
+                break
+
+            self._search(role)
+            page = 1
+
+            while not self._should_stop():
+                self._scroll_list()
+                cards = self._get_job_cards()
+
+                if not cards:
+                    self.log(f"[INFO] No more cards for '{role}' (page {page}).")
+                    break
+
+                seen_titles: set[str] = set()
+
+                for card in cards:
+                    if self._should_stop():
+                        break
+                    try:
+                        title   = self._get_title(card)
+                        company = self._get_company(card)
+                        url     = self._get_url(card)
+                        job_id  = _job_id_from_url(url)
+
+                        if title in seen_titles or not url:
+                            continue
+                        seen_titles.add(title)
+
+                        if job_id and job_id in self._applied_ids:
+                            self.log(f"[SKIP] Already applied: {title}")
+                            continue
+                        if job_id and job_id in seen_ids:
+                            continue
+                        seen_ids.add(job_id or url)
+
+                        skip, word = self._check_ignore(title)
+                        if skip:
+                            self.log(f"[SKIP] Ignored ('{word}'): {title}")
+                            continue
+
+                        if not self._check_role_match(title):
+                            self.log(f"[SKIP] Off-role: {title}")
+                            continue
+
+                        collected.append({
+                            "title":        title,
+                            "company":      company,
+                            "url":          url,
+                            "job_id":       job_id,
+                            "role":         role,
+                            "status":       "Pending",
+                            "notes":        "",
+                            "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                        self.log(f"[COLLECT] #{len(collected)}  {title}  @  {company}")
+
+                        if self.collect_callback:
+                            self.collect_callback(len(collected))
+
+                    except StaleElementReferenceException:
+                        break
+                    except Exception as exc:
+                        self.log(f"[WARN] Card read error: {exc}")
+                        continue
+
+                if not self._next_page(page):
+                    break
+                page += 1
+
+        return collected
+
+    # ─────────────────────────────────── Phase 2 — apply
+
+    def _apply_phase(self, jobs: list[dict]) -> None:
+        """
+        Application pass — navigates to each collected job URL directly.
+        No search-page scraping. Updates Excel row status after every attempt.
+        """
+        max_apps  = int(self.config.get("max_applications", 50))
+        self._total_to_apply = len(jobs)
+        # jobs[0] is at Excel row 2 (header = row 1)
+        base_row  = 2
+
+        for i, job in enumerate(jobs):
+            if self._should_stop() or self.applied_count >= max_apps:
+                break
+
+            excel_row = base_row + i
+            title     = job["title"]
+            company   = job["company"]
+            url       = job["url"]
+            role      = job.get("role", "")
+            now       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            total     = len(jobs)
+
+            self.log(f"\n[INFO] ── Applying {i+1}/{total}: {title} @ {company}")
+
+            # Navigate directly to the job page — no re-scraping
+            try:
+                self.driver.get(url)
+                self._delay(2, 4)
+            except Exception as e:
+                self.log(f"[WARN] Could not load job page: {e}")
+                job["status"] = "Failed"
+                job["notes"]  = "page load error"
+                update_collected_status(excel_row, "Failed", "page load error", self.log)
+                continue
+
+            # Resolve URL in case of redirect (LinkedIn might use currentJobId)
+            final_url = _clean_job_url(self.driver.current_url)
+            job_id    = _job_id_from_url(final_url)
+            if job_id and job_id in self._applied_ids:
+                self.log(f"[SKIP] Already applied: {title}")
+                job["status"] = "Already Applied"
+                update_collected_status(excel_row, "Already Applied", "", self.log)
+                continue
+
+            # Job-type keyword check (needs page content)
+            detail_text       = self._get_detail_text()
+            type_ok, type_why = self._check_job_type(title, detail_text)
+            if not type_ok:
+                self.log(f"[SKIP] Job type mismatch ({type_why}): {title}")
+                job["status"] = "Skipped"
+                job["notes"]  = type_why
+                update_collected_status(excel_row, "Skipped", type_why, self.log)
+                self.ignored_jobs.append({
+                    "title": title, "company": company, "url": final_url,
+                    "timestamp": now, "reason": f"job type: {type_why}", "role": role,
+                })
+                continue
+
+            if not self._click_easy_apply():
+                self.log(f"[SKIP] No Easy Apply button: {title}")
+                job["status"] = "No Easy Apply"
+                update_collected_status(excel_row, "No Easy Apply", "", self.log)
+                self.failed_jobs.append({
+                    "title": title, "company": company, "url": final_url,
+                    "timestamp": now, "reason": "no Easy Apply button", "role": role,
+                })
+                continue
+
+            success, fail_reason = self._handle_form()
+
+            if success:
+                self.applied_count += 1
+                self._applied_ids.add(job_id)
+                job["status"] = "Applied"
+                update_collected_status(excel_row, "Applied", "", self.log)
+                self.applied_jobs.append({
+                    "title": title, "company": company, "url": final_url,
+                    "timestamp": now, "reason": "", "role": role,
+                })
+                if self.apply_callback:
+                    self.apply_callback(self.applied_count, self._total_to_apply)
+                self.log(f"[SUCCESS] Applied ({self.applied_count}/{max_apps}): {title} @ {company}")
+            else:
+                job["status"] = "Failed"
+                job["notes"]  = fail_reason
+                update_collected_status(excel_row, "Failed", fail_reason, self.log)
+                self.failed_jobs.append({
+                    "title": title, "company": company, "url": final_url,
+                    "timestamp": now, "reason": fail_reason, "role": role,
+                })
+                self.log(f"[WARN] Failed ({fail_reason}): {title}")
+
+            self._delay()
+
     # ─────────────────────────────────── main run
 
-    def run(self):
+    def run(self, collect_only: bool = False):
+        """
+        Two-phase execution:
+          Phase 1 — Collect: scrape all matching job cards (fast, no detail clicks).
+                              Save to 'Collected Jobs' sheet in linkedin_jobs.xlsx.
+          Phase 2 — Apply:   navigate to each URL directly and apply.
+                              Update status in Excel row-by-row as we go.
+        Pass collect_only=True to stop after Phase 1 (no applications made).
+        """
         try:
             self._setup_driver()
-
             if not self._login():
                 return
 
-            # Load previously applied jobs so we never double-apply
             self._applied_ids = load_applied_job_ids(self.log)
 
-            max_apps = int(self.config.get("max_applications", 50))
-            roles    = self.config.get("job_roles", [])
+            # ── Phase 1 ──────────────────────────────────────────
+            self.log("\n[INFO] ═══ PHASE 1 — Collecting jobs ═══")
+            collected = self._collect_phase()
 
-            for role in roles:
-                if self._should_stop() or self.applied_count >= max_apps:
-                    break
+            self.log(f"[INFO] Collected {len(collected)} jobs matching your filters.")
+            save_collected_jobs(collected, self.log)
 
-                self._search(role)
-                page = 1
+            if collect_only or self._should_stop() or not collected:
+                if collect_only:
+                    self.log("[INFO] Collect-only mode — skipping application phase.")
+                elif not collected:
+                    self.log("[INFO] Nothing to apply to.")
+                return
 
-                while not self._should_stop() and self.applied_count < max_apps:
-                    self._scroll_list()
-                    cards = self._get_job_cards()
-
-                    if not cards:
-                        self.log(f"[INFO] No job cards for '{role}' on page {page}.")
-                        break
-
-                    seen_titles: set[str] = set()
-
-                    for idx in range(len(cards)):
-                        if self._should_stop() or self.applied_count >= max_apps:
-                            break
-
-                        try:
-                            cards = self._get_job_cards()
-                            if idx >= len(cards):
-                                break
-                            card = cards[idx]
-                        except Exception:
-                            break
-
-                        try:
-                            title   = self._get_title(card)
-                            company = self._get_company(card)
-                            url     = self._get_url(card)
-                            now     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            job_id  = _job_id_from_url(url)
-
-                            if title in seen_titles:
-                                continue
-                            seen_titles.add(title)
-
-                            # ── Filter 1: already applied ──────────────────
-                            if job_id and job_id in self._applied_ids:
-                                self.log(f"[SKIP] Already applied: {title}")
-                                continue
-
-                            # ── Filter 2: ignore list ──────────────────────
-                            ignored, matched_word = self._check_ignore(title)
-                            if ignored:
-                                self.log(f"[SKIP] Ignored ('{matched_word}'): {title}")
-                                self.ignored_jobs.append({
-                                    "title": title, "company": company, "url": url,
-                                    "timestamp": now, "reason": f"ignore word: {matched_word}",
-                                    "role": role,
-                                })
-                                continue
-
-                            # ── Filter 3: strict role match ────────────────
-                            if not self._check_role_match(title):
-                                self.log(f"[SKIP] Off-role: {title}")
-                                self.ignored_jobs.append({
-                                    "title": title, "company": company, "url": url,
-                                    "timestamp": now, "reason": "off-role (no role keyword in title)",
-                                    "role": role,
-                                })
-                                continue
-
-                            self.log(f"[INFO] Checking: {title} @ {company}")
-
-                            # Click to open job detail
-                            if not self._click_card(card):
-                                self.failed_jobs.append({
-                                    "title": title, "company": company, "url": url,
-                                    "timestamp": now, "reason": "could not click card", "role": role,
-                                })
-                                continue
-
-                            # Prefer the card href URL (already clean); fall back to
-                            # address bar which may use the ?currentJobId= form.
-                            if not url:
-                                url = _clean_job_url(self.driver.current_url)
-                            job_id = _job_id_from_url(url)
-
-                            # Re-check with confirmed job ID (catches cases where
-                            # the card href was missing but currentJobId is present)
-                            if job_id and job_id in self._applied_ids:
-                                self.log(f"[SKIP] Already applied: {title}")
-                                continue
-
-                            # ── Filter 4: job type keywords ────────────────
-                            detail_text          = self._get_detail_text()
-                            type_ok, type_reason = self._check_job_type(title, detail_text)
-                            if not type_ok:
-                                self.log(f"[SKIP] Job type mismatch ({type_reason}): {title}")
-                                self.ignored_jobs.append({
-                                    "title": title, "company": company, "url": url,
-                                    "timestamp": now, "reason": f"job type: {type_reason}",
-                                    "role": role,
-                                })
-                                continue
-
-                            # ── Easy Apply ─────────────────────────────────
-                            if not self._click_easy_apply():
-                                self.log(f"[SKIP] No Easy Apply: {title}")
-                                self.failed_jobs.append({
-                                    "title": title, "company": company, "url": url,
-                                    "timestamp": now, "reason": "no Easy Apply button", "role": role,
-                                })
-                                continue
-
-                            success, fail_reason = self._handle_form()
-
-                            if success:
-                                self.applied_count += 1
-                                self._applied_ids.add(job_id)    # prevent re-apply in same session
-                                self.applied_jobs.append({
-                                    "title": title, "company": company, "url": url,
-                                    "timestamp": now, "reason": "", "role": role,
-                                })
-                                if self.count_callback:
-                                    self.count_callback(self.applied_count)
-                                self.log(
-                                    f"[SUCCESS] Applied ({self.applied_count}/{max_apps}): "
-                                    f"{title} @ {company}"
-                                )
-                            else:
-                                self.log(f"[WARN] Failed ({fail_reason}): {title}")
-                                self.failed_jobs.append({
-                                    "title": title, "company": company, "url": url,
-                                    "timestamp": now, "reason": fail_reason, "role": role,
-                                })
-
-                            self._delay()
-
-                        except StaleElementReferenceException:
-                            self.log("[WARN] DOM changed; refreshing card list.")
-                            break
-                        except Exception as exc:
-                            self.log(f"[ERROR] {exc}")
-                            try:
-                                self._close_modal()
-                                self._discard()
-                            except Exception:
-                                pass
-
-                    if not self._next_page(page):
-                        break
-                    page += 1
+            # ── Phase 2 ──────────────────────────────────────────
+            self.log(f"\n[INFO] ═══ PHASE 2 — Applying to {len(collected)} jobs ═══")
+            self._apply_phase(collected)
 
             self.log(
                 f"\n[DONE] Applied: {len(self.applied_jobs)}  |  "
-                f"Ignored: {len(self.ignored_jobs)}  |  "
+                f"Skipped/Ignored: {len(self.ignored_jobs)}  |  "
                 f"Failed: {len(self.failed_jobs)}"
             )
-
             update_excel(self.applied_jobs, self.ignored_jobs, self.failed_jobs, self.log)
 
         finally:
@@ -960,37 +1313,50 @@ def update_feed_excel(posts: list[dict], log: Callable) -> None:
 # Feed Scanner
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Selectors for feed post containers
-FEED_POST_SELECTORS = [
+# ── Post result containers (tried in order for both search and feed pages) ──
+POST_CONTAINER_SELECTORS = [
+    # LinkedIn content/post search results page
+    "li.reusable-search__result-container",
+    "div.search-results__list > li",
+    # Feed page fallback
     "div.feed-shared-update-v2",
     "div[data-urn*='activity']",
     "li.occludable-update",
-    "div.occludable-update",
 ]
 
-# Selectors for post text body
+# ── Post body text ──
 POST_TEXT_SELECTORS = [
+    ".update-components-text span.break-words",
+    ".update-components-text",
     "div.feed-shared-update-v2__description span.break-words",
     "div.feed-shared-update-v2__description",
-    ".feed-shared-text span",
     ".attributed-text-segment-list__content",
     "span.break-words",
-    ".update-components-text",
+    # content search snippet
+    ".reusable-search-simple-insight__text",
+    ".entity-result__simple-insight-text",
+    "p[class*='insight']",
 ]
 
-# Selectors for author display name
+# ── Author name ──
 AUTHOR_NAME_SELECTORS = [
     ".update-components-actor__name span[aria-hidden='true']",
+    ".update-components-actor__name",
     ".feed-shared-actor__name",
-    "span.feed-shared-actor__name",
-    ".update-components-actor__title span[aria-hidden='true']",
+    # content search author
+    ".entity-result__title-text a",
+    "span.entity-result__title-text",
+    "a.app-aware-link[href*='/in/']",
 ]
 
-# Selectors for author profile link
+# ── Author profile URL ──
 AUTHOR_URL_SELECTORS = [
     "a.update-components-actor__container",
     "a.feed-shared-actor__container-link",
-    "a[href*='/in/'][class*='actor']",
+    # content search
+    ".entity-result__title-text a[href*='/in/']",
+    "a[href*='/in/'][class*='result']",
+    "a[href*='/in/']",
 ]
 
 
@@ -1103,10 +1469,11 @@ class FeedScanner:
     # ─────────────────────────────────── post extraction
 
     def _get_posts(self) -> list:
-        for sel in FEED_POST_SELECTORS:
+        time.sleep(1.5)
+        for sel in POST_CONTAINER_SELECTORS:
             posts = self.driver.find_elements(By.CSS_SELECTOR, sel)
             visible = [p for p in posts if p.is_displayed()]
-            if len(visible) > 1:
+            if len(visible) >= 1:
                 return visible
         return []
 
@@ -1177,6 +1544,168 @@ class FeedScanner:
             if kw.strip().lower() in lower
         ]
 
+    # ─────────────────────────────────── search
+
+    def _build_search_queries(self) -> list[str]:
+        """
+        Combine feed_keywords × job_roles to generate search queries.
+        e.g. keywords=["C2C","Contract"], roles=["ai engineer"]
+          → ["C2C ai engineer", "Contract ai engineer", "C2C", "Contract"]
+        Deduplicates and caps at 20 queries.
+        """
+        keywords = [k.strip() for k in self.config.get("feed_keywords", []) if k.strip()]
+        roles    = [r.strip() for r in self.config.get("job_roles", []) if r.strip()]
+
+        queries: list[str] = []
+        seen: set[str] = set()
+
+        def _add(q: str):
+            if q.lower() not in seen:
+                seen.add(q.lower())
+                queries.append(q)
+
+        # keyword + role combinations first (most specific)
+        for kw in keywords:
+            for role in roles:
+                _add(f"{kw} {role}")
+
+        # then keyword alone
+        for kw in keywords:
+            _add(kw)
+
+        return queries[:20]
+
+    def _navigate_to_search(self, query: str):
+        """Open LinkedIn post/content search for the given query."""
+        encoded = query.replace(" ", "%20")
+        url = (
+            f"https://www.linkedin.com/search/results/content/"
+            f"?keywords={encoded}&origin=GLOBAL_SEARCH_HEADER&sortBy=date_posted"
+        )
+        self.log(f"[INFO] Searching posts: '{query}'")
+        self.driver.get(url)
+        self._delay(3, 5)
+        # Wait for results container
+        try:
+            WebDriverWait(self.driver, 12).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "div.search-results-container, div.scaffold-layout__list")
+                )
+            )
+        except TimeoutException:
+            self.log(f"[WARN] Search results slow to load for '{query}'")
+
+    # ─────────────────────────────────── post helpers
+
+    def _get_urn(self, post) -> str:
+        for attr in ("data-urn", "data-id", "data-activity-urn"):
+            val = post.get_attribute(attr) or ""
+            if val:
+                return val
+        return ""
+
+    def _get_post_url(self, post) -> str:
+        urn = self._get_urn(post)
+        if urn:
+            return f"https://www.linkedin.com/feed/update/{urn}/"
+        try:
+            for a in post.find_elements(By.TAG_NAME, "a"):
+                href = a.get_attribute("href") or ""
+                if "feed/update" in href or "ugcPost" in href or "activity" in href:
+                    return href.split("?")[0]
+        except Exception:
+            pass
+        return self.driver.current_url.split("?")[0]
+
+    def _get_author_name(self, post) -> str:
+        for sel in AUTHOR_NAME_SELECTORS:
+            try:
+                t = post.find_element(By.CSS_SELECTOR, sel).text.strip()
+                if t:
+                    return t
+            except NoSuchElementException:
+                continue
+        return "Unknown Author"
+
+    def _get_author_url(self, post) -> str:
+        for sel in AUTHOR_URL_SELECTORS:
+            try:
+                href = post.find_element(By.CSS_SELECTOR, sel).get_attribute("href") or ""
+                if "/in/" in href:
+                    return href.split("?")[0]
+            except NoSuchElementException:
+                continue
+        return ""
+
+    def _get_post_text(self, post) -> str:
+        # Try dedicated text selectors
+        for sel in POST_TEXT_SELECTORS:
+            try:
+                t = post.find_element(By.CSS_SELECTOR, sel).text.strip()
+                if len(t) > 20:
+                    return t
+            except NoSuchElementException:
+                continue
+        # Fallback: all text inside the card
+        try:
+            t = post.text.strip()
+            if len(t) > 20:
+                return t
+        except Exception:
+            pass
+        return ""
+
+    def _keywords_in_text(self, text: str) -> list[str]:
+        lower = text.lower()
+        return [kw for kw in self.config.get("feed_keywords", [])
+                if kw.strip().lower() in lower]
+
+    def _process_post(self, post, found_count: int) -> int:
+        """Extract data from one post element; save if keywords match. Returns new found_count."""
+        try:
+            urn = self._get_urn(post)
+            if urn and urn in self._seen_urns:
+                return found_count
+            if urn:
+                self._seen_urns.add(urn)
+
+            text    = self._get_post_text(post)
+            matched = self._keywords_in_text(text) if text else []
+            if not matched:
+                return found_count
+
+            author     = self._get_author_name(post)
+            author_url = self._get_author_url(post)
+            post_url   = self._get_post_url(post)
+            now        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            preview    = text[:250].replace("\n", " ")
+            kw_str     = ", ".join(matched)
+
+            found_count += 1
+            self.found_posts.append({
+                "author":        author,
+                "author_url":    author_url,
+                "post_url":      post_url,
+                "preview":       preview,
+                "keywords_found": kw_str,
+                "timestamp":     now,
+            })
+            if self.count_callback:
+                self.count_callback(found_count)
+
+            self.log(
+                f"[FOUND] #{found_count}  {author}  |  {kw_str}\n"
+                f"        {post_url}\n"
+                f"        {preview[:120]}..."
+            )
+
+        except StaleElementReferenceException:
+            pass
+        except Exception as exc:
+            self.log(f"[WARN] Post parse error: {exc}")
+
+        return found_count
+
     # ─────────────────────────────────── main run
 
     def run(self):
@@ -1185,77 +1714,38 @@ class FeedScanner:
             if not self._login():
                 return
 
-            self.log("[INFO] Navigating to LinkedIn feed...")
-            self.driver.get("https://www.linkedin.com/feed/")
-            self._delay(3, 5)
+            queries     = self._build_search_queries()
+            max_scrolls = int(self.config.get("feed_max_scrolls", 30))
+            found_count = 0
 
-            max_scrolls  = int(self.config.get("feed_max_scrolls", 30))
-            keywords     = [k.strip() for k in self.config.get("feed_keywords", []) if k.strip()]
-            found_count  = 0
+            # Distribute scrolls evenly across queries
+            scrolls_per_query = max(3, max_scrolls // max(len(queries), 1))
 
-            self.log(f"[INFO] Scanning feed for: {keywords}  (up to {max_scrolls} scrolls)")
+            self.log(f"[INFO] {len(queries)} search queries | {scrolls_per_query} scrolls each")
+            self.log(f"[INFO] Queries: {queries}")
 
-            for scroll_num in range(max_scrolls):
+            for query in queries:
                 if self._should_stop():
                     break
 
-                posts = self._get_posts()
-                self.log(f"[DEBUG] Scroll {scroll_num + 1}/{max_scrolls} — {len(posts)} posts visible")
+                self._navigate_to_search(query)
 
-                for post in posts:
+                for scroll_num in range(scrolls_per_query):
                     if self._should_stop():
                         break
-                    try:
-                        urn = self._get_urn(post)
-                        if urn and urn in self._seen_urns:
-                            continue
-                        if urn:
-                            self._seen_urns.add(urn)
 
-                        text = self._get_post_text(post)
-                        if not text:
-                            continue
+                    posts = self._get_posts()
+                    self.log(f"[DEBUG] '{query}' scroll {scroll_num+1} — {len(posts)} items")
 
-                        matched = self._keywords_in_text(text)
-                        if not matched:
-                            continue
+                    for post in posts:
+                        if self._should_stop():
+                            break
+                        found_count = self._process_post(post, found_count)
 
-                        author      = self._get_author_name(post)
-                        author_url  = self._get_author_url(post)
-                        post_url    = self._get_post_url(post)
-                        now         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        preview     = text[:200].replace("\n", " ")
-                        kw_str      = ", ".join(matched)
+                    self.driver.execute_script("window.scrollBy(0, window.innerHeight * 1.8);")
+                    self._delay(2.5, 4.5)
 
-                        found_count += 1
-                        self.found_posts.append({
-                            "author":        author,
-                            "author_url":    author_url,
-                            "post_url":      post_url,
-                            "preview":       preview,
-                            "keywords_found": kw_str,
-                            "timestamp":     now,
-                        })
-                        if self.count_callback:
-                            self.count_callback(found_count)
-
-                        self.log(
-                            f"[FOUND] #{found_count}  {author}  |  keywords: {kw_str}\n"
-                            f"        URL: {post_url}\n"
-                            f"        Preview: {preview[:120]}..."
-                        )
-
-                    except StaleElementReferenceException:
-                        continue
-                    except Exception as exc:
-                        self.log(f"[WARN] Post parse error: {exc}")
-                        continue
-
-                # Scroll down to load more posts
-                self.driver.execute_script("window.scrollBy(0, window.innerHeight * 1.5);")
-                self._delay(2.5, 4.5)
-
-            self.log(f"\n[DONE] Feed scan complete. Posts found: {found_count}")
+            self.log(f"\n[DONE] Scan complete — {found_count} posts found across {len(queries)} searches")
             update_feed_excel(self.found_posts, self.log)
 
         finally:

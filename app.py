@@ -32,6 +32,28 @@ DEFAULT_CONFIG = {
     # Feed scanner
     "feed_keywords": ["C2C", "Contract", "W2", "Hiring", "Looking for"],
     "feed_max_scrolls": 30,
+    # Easy Apply form auto-fill answers
+    "form_answers": {
+        "phone":              "",
+        "years_experience":   "2",
+        "authorized_to_work": "Yes",
+        "require_sponsorship":"No",
+        "willing_to_relocate":"No",
+        "work_preference":    "Remote",
+        "education_level":    "Bachelor's Degree",
+        "exp_level_label":    "Entry level",
+        "work_type":          "Full-time",
+        "expected_salary":    "",
+        "expected_rate":      "",
+        "city":               "",
+        "state":              "",
+        "zip_code":           "",
+        "country":            "United States",
+        "linkedin_url":       "",
+        "portfolio_url":      "",
+        "default_yes_no":     "Yes",
+        "cover_letter":       "",
+    },
 }
 
 DATE_OPTIONS       = ["Any Time", "Past Month", "Past Week", "Past 24 hours"]
@@ -61,6 +83,7 @@ class LinkedInApp:
         self.feed_thread:  threading.Thread | None = None
         self.is_running      = False
         self.feed_is_running = False
+        self._collect_only_mode = False   # True when "Collect Only" was pressed
 
         self._build_ui()
         self._poll_queues()
@@ -103,6 +126,27 @@ class LinkedInApp:
         self.config["job_type_keywords"] = list(self.kw_lb.get(0, tk.END))
         self.config["feed_keywords"]     = list(self.feed_kw_lb.get(0, tk.END))
         self.config["feed_max_scrolls"]  = int(self.feed_scrolls_var.get())
+        self.config["form_answers"] = {
+            "phone":              self.fa_phone.get().strip(),
+            "years_experience":   self.fa_years.get().strip(),
+            "authorized_to_work": self.fa_work_auth.get(),
+            "require_sponsorship":self.fa_sponsorship.get(),
+            "willing_to_relocate":self.fa_relocate.get(),
+            "work_preference":    self.fa_work_pref.get(),
+            "education_level":    self.fa_education.get(),
+            "exp_level_label":    self.fa_exp_level.get(),
+            "work_type":          self.fa_work_type.get(),
+            "expected_salary":    self.fa_salary.get().strip(),
+            "expected_rate":      self.fa_rate.get().strip(),
+            "city":               self.fa_city.get().strip(),
+            "state":              self.fa_state.get().strip(),
+            "zip_code":           self.fa_zip.get().strip(),
+            "country":            self.fa_country.get().strip(),
+            "linkedin_url":       self.fa_linkedin.get().strip(),
+            "portfolio_url":      self.fa_portfolio.get().strip(),
+            "default_yes_no":     self.fa_default_yn.get(),
+            "cover_letter":       self.fa_cover.get("1.0", tk.END).strip(),
+        }
 
     def _apply_changes(self):
         """
@@ -138,6 +182,7 @@ class LinkedInApp:
         self._tab_roles(nb)
         self._tab_ignore(nb)
         self._tab_filters(nb)
+        self._tab_form_answers(nb)
         self._tab_feed_scanner(nb)
         self._tab_logs(nb)
 
@@ -145,8 +190,13 @@ class LinkedInApp:
         job_ctrl = ttk.LabelFrame(outer, text="Job Bot", padding=(8, 4))
         job_ctrl.grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
-        self.start_btn = ttk.Button(job_ctrl, text="Start Automation", command=self._start)
-        self.start_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.start_btn = ttk.Button(job_ctrl, text="▶  Collect + Apply",
+                                    command=lambda: self._start(collect_only=False))
+        self.start_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.collect_btn = ttk.Button(job_ctrl, text="📋  Collect Only",
+                                      command=lambda: self._start(collect_only=True))
+        self.collect_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         self.stop_btn = ttk.Button(job_ctrl, text="Stop", command=self._stop, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 6))
@@ -159,7 +209,8 @@ class LinkedInApp:
                   foreground="#555555").pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Button(job_ctrl, text="Save Config", command=self._save_config).pack(side=tk.LEFT)
-        self.apps_label = ttk.Label(job_ctrl, text="Applied: 0", font=("Helvetica", 9, "bold"))
+        self.apps_label = ttk.Label(job_ctrl, text="Collected: 0 | Applied: 0",
+                                    font=("Helvetica", 9, "bold"))
         self.apps_label.pack(side=tk.RIGHT)
 
         self.status_var = tk.StringVar(value="Ready")
@@ -316,6 +367,156 @@ class LinkedInApp:
         self._btn_row(kw_box, 4,
                       lambda: self._add_to(self.kw_lb, self.kw_entry),
                       lambda: self._remove_from(self.kw_lb))
+
+    # ── form answers tab ──────────────────────────────────────────
+
+    def _tab_form_answers(self, nb):
+        outer = ttk.Frame(nb, padding=0)
+        nb.add(outer, text="  Form Answers  ")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+
+        frame = ttk.Frame(canvas, padding=12)
+        frame_id = canvas.create_window((0, 0), window=frame, anchor="nw")
+
+        def _on_resize(e):
+            canvas.itemconfig(frame_id, width=e.width)
+        canvas.bind("<Configure>", _on_resize)
+
+        frame.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        # Mouse-wheel scroll
+        def _scroll(e):
+            canvas.yview_scroll(-1 * (e.delta // 120), "units")
+        canvas.bind_all("<MouseWheel>", _scroll)
+
+        frame.columnconfigure(1, weight=1)
+        fa = self.config.get("form_answers", DEFAULT_CONFIG["form_answers"])
+        r = 0
+
+        YES_NO      = ["Yes", "No"]
+        WORK_PREF   = ["Remote", "Hybrid", "On-site", "Any"]
+        EDU_LEVELS  = ["High School", "Associate's Degree", "Bachelor's Degree",
+                       "Master's Degree", "PhD", "Other"]
+        EXP_LEVELS  = ["Internship", "Entry level", "Associate", "Mid-Senior level", "Director"]
+        WORK_TYPES  = ["Full-time", "Part-time", "Contract", "Temporary", "Internship"]
+
+        def section(lbl):
+            nonlocal r
+            ttk.Separator(frame).grid(row=r, column=0, columnspan=2, sticky="ew", pady=(10, 4))
+            r += 1
+            ttk.Label(frame, text=lbl, font=("Helvetica", 10, "bold")).grid(
+                row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
+            r += 1
+
+        def entry_row(lbl, var, show=""):
+            nonlocal r
+            ttk.Label(frame, text=lbl).grid(row=r, column=0, sticky="w", pady=3, padx=(0, 10))
+            ttk.Entry(frame, textvariable=var, show=show, width=38).grid(
+                row=r, column=1, sticky="ew")
+            r += 1
+
+        def combo_row(lbl, var, values):
+            nonlocal r
+            ttk.Label(frame, text=lbl).grid(row=r, column=0, sticky="w", pady=3, padx=(0, 10))
+            ttk.Combobox(frame, textvariable=var, values=values,
+                         state="readonly", width=25).grid(row=r, column=1, sticky="w")
+            r += 1
+
+        ttk.Label(frame,
+                  text="These answers are used to auto-fill prerequisite questions in Easy Apply forms.\n"
+                       "Leave a field blank to skip filling it.",
+                  foreground="#444", wraplength=500, justify=tk.LEFT).grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        r += 1
+
+        # ── Contact ──────────────────────────────────────
+        section("Contact Info")
+        self.fa_phone = tk.StringVar(value=fa.get("phone", ""))
+        entry_row("Phone Number:", self.fa_phone)
+
+        self.fa_city  = tk.StringVar(value=fa.get("city", ""))
+        entry_row("City:", self.fa_city)
+
+        self.fa_state = tk.StringVar(value=fa.get("state", ""))
+        entry_row("State / Province:", self.fa_state)
+
+        self.fa_zip   = tk.StringVar(value=fa.get("zip_code", ""))
+        entry_row("Zip / Postal Code:", self.fa_zip)
+
+        self.fa_country = tk.StringVar(value=fa.get("country", "United States"))
+        entry_row("Country:", self.fa_country)
+
+        # ── Experience ────────────────────────────────────
+        section("Experience & Work Authorization")
+
+        self.fa_years = tk.StringVar(value=fa.get("years_experience", "2"))
+        entry_row("Years of Experience  (used for any 'years of exp' question):", self.fa_years)
+
+        self.fa_education = tk.StringVar(value=fa.get("education_level", "Bachelor's Degree"))
+        combo_row("Highest Education Level:", self.fa_education, EDU_LEVELS)
+
+        self.fa_exp_level = tk.StringVar(value=fa.get("exp_level_label", "Entry level"))
+        combo_row("Experience Level (dropdowns):", self.fa_exp_level, EXP_LEVELS)
+
+        self.fa_work_auth = tk.StringVar(value=fa.get("authorized_to_work", "Yes"))
+        combo_row("Authorized to work in the US?", self.fa_work_auth, YES_NO)
+
+        self.fa_sponsorship = tk.StringVar(value=fa.get("require_sponsorship", "No"))
+        combo_row("Require visa sponsorship?", self.fa_sponsorship, YES_NO)
+
+        self.fa_relocate = tk.StringVar(value=fa.get("willing_to_relocate", "No"))
+        combo_row("Willing to relocate?", self.fa_relocate, YES_NO)
+
+        self.fa_work_pref = tk.StringVar(value=fa.get("work_preference", "Remote"))
+        combo_row("Work preference (Remote/Hybrid/On-site)?", self.fa_work_pref, WORK_PREF)
+
+        self.fa_work_type = tk.StringVar(value=fa.get("work_type", "Full-time"))
+        combo_row("Employment type (dropdowns):", self.fa_work_type, WORK_TYPES)
+
+        # ── Compensation ─────────────────────────────────
+        section("Compensation")
+
+        self.fa_salary = tk.StringVar(value=fa.get("expected_salary", ""))
+        entry_row("Expected Annual Salary ($ numbers only):", self.fa_salary)
+
+        self.fa_rate = tk.StringVar(value=fa.get("expected_rate", ""))
+        entry_row("Expected Hourly Rate ($ numbers only):", self.fa_rate)
+
+        # ── Links ─────────────────────────────────────────
+        section("Profile Links")
+
+        self.fa_linkedin = tk.StringVar(value=fa.get("linkedin_url", ""))
+        entry_row("LinkedIn Profile URL:", self.fa_linkedin)
+
+        self.fa_portfolio = tk.StringVar(value=fa.get("portfolio_url", ""))
+        entry_row("GitHub / Portfolio URL:", self.fa_portfolio)
+
+        # ── Defaults ─────────────────────────────────────
+        section("Fallback Behaviour")
+
+        self.fa_default_yn = tk.StringVar(value=fa.get("default_yes_no", "Yes"))
+        combo_row("Default answer for unknown Yes/No questions:", self.fa_default_yn, YES_NO)
+
+        # ── Cover Letter ──────────────────────────────────
+        section("Cover Letter (optional)")
+        ttk.Label(frame, text="Pasted into any cover letter / additional info text box.\n"
+                              "Leave blank to skip.", foreground="#555").grid(
+            row=r, column=0, columnspan=2, sticky="w")
+        r += 1
+        self.fa_cover = tk.Text(frame, height=6, wrap=tk.WORD, font=("Consolas", 9))
+        self.fa_cover.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        cover_text = fa.get("cover_letter", "")
+        if cover_text:
+            self.fa_cover.insert("1.0", cover_text)
+        r += 1
 
     # ── feed scanner tab ──────────────────────────────────────────
 
@@ -478,7 +679,7 @@ class LinkedInApp:
 
     # ──────────────────────────────────────────── job bot
 
-    def _start(self):
+    def _start(self, collect_only: bool = False):
         self._sync_config_from_ui()
         if not self.config["email"] or not self.config["password"]:
             messagebox.showerror("Missing credentials", "Enter your LinkedIn email and password.")
@@ -490,21 +691,29 @@ class LinkedInApp:
             messagebox.showerror("Invalid delays", "Min delay must be less than Max delay.")
             return
 
+        self._collect_only_mode = collect_only
         self.is_running = True
         self.start_btn.config(state=tk.DISABLED)
+        self.collect_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
-        self.status_var.set("Running...")
-        self.apps_label.config(text="Applied: 0")
+
+        if collect_only:
+            self.status_var.set("Phase 1 — Collecting jobs…")
+            self.apps_label.config(text="Collected: 0")
+        else:
+            self.status_var.set("Phase 1 — Collecting jobs…")
+            self.apps_label.config(text="Collected: 0 | Applied: 0")
 
         # Bot receives self.config BY REFERENCE — Apply Changes Now just updates
         # this same dict, and the bot reads it dynamically on every action.
-        self.bot = LinkedInBot(self.config, self._log_job, self._on_count_update)
+        self.bot = LinkedInBot(self.config, self._log_job,
+                               self._on_collect_update, self._on_apply_update)
         self.bot_thread = threading.Thread(target=self._run_bot, daemon=True)
         self.bot_thread.start()
 
     def _run_bot(self):
         try:
-            self.bot.run()
+            self.bot.run(collect_only=self._collect_only_mode)
         except Exception as exc:
             self._log_job(f"[ERROR] Unexpected crash: {exc}")
         finally:
@@ -516,14 +725,39 @@ class LinkedInApp:
         self.status_var.set("Stopping…")
         self.stop_btn.config(state=tk.DISABLED)
 
-    def _on_count_update(self, count: int):
-        self.root.after(0, lambda: self.apps_label.config(text=f"Applied: {count}"))
+    # ── count callbacks (called from bot thread → schedule on main thread) ──
+
+    def _on_collect_update(self, collected: int):
+        """Called by the bot each time a job is added to the collected list."""
+        def _update():
+            if self._collect_only_mode:
+                self.apps_label.config(text=f"Collected: {collected}")
+            else:
+                # Keep existing applied count; only refresh collected portion
+                cur = self.apps_label.cget("text")
+                applied_part = cur.split("|")[1].strip() if "|" in cur else "Applied: 0"
+                self.apps_label.config(text=f"Collected: {collected} | {applied_part}")
+            self.status_var.set(f"Phase 1 — Collecting jobs… ({collected} so far)")
+        self.root.after(0, _update)
+
+    def _on_apply_update(self, applied: int, total: int):
+        """Called by the bot each time an application succeeds/fails in Phase 2."""
+        def _update():
+            cur = self.apps_label.cget("text")
+            collected_part = cur.split("|")[0].strip() if "|" in cur else "Collected: ?"
+            self.apps_label.config(text=f"{collected_part} | Applied: {applied}/{total}")
+            self.status_var.set(f"Phase 2 — Applying… ({applied}/{total})")
+        self.root.after(0, _update)
 
     def _on_bot_finished(self):
         self.is_running = False
         self.start_btn.config(state=tk.NORMAL)
+        self.collect_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self.status_var.set("Finished")
+        if self._collect_only_mode:
+            self.status_var.set("Collect phase complete — check linkedin_jobs.xlsx")
+        else:
+            self.status_var.set("Finished")
 
     # ──────────────────────────────────────────── feed scanner
 
