@@ -234,8 +234,9 @@ def load_applied_job_ids(log: Callable) -> set:
 def save_collected_jobs(jobs: list[dict], log: Callable) -> None:
     """
     Write the collected-jobs pipeline to the 'Collected Jobs' sheet.
-    Called at the end of Phase 1.  Existing rows are preserved; new ones appended.
-    Each job dict must have: title, company, url, role, collected_at, status, notes.
+    Called at the end of Phase 1.  **Clears old data** so the sheet always
+    reflects the current run and row numbers match what _apply_phase expects
+    (job 0 → Excel row 2, job 1 → row 3, etc.).
     """
     if not EXCEL_OK:
         log("[WARN] openpyxl not installed — cannot save collected jobs.")
@@ -245,15 +246,18 @@ def save_collected_jobs(jobs: list[dict], log: Callable) -> None:
     try:
         wb  = _load_or_create_workbook()
         ws  = _ensure_sheet(wb, "Collected Jobs")
-        rf  = PatternFill("solid", fgColor=SHEET_META["Collected Jobs"]["row_color"])
-        start = ws.max_row   # 1 = header row only
 
-        for offset, j in enumerate(jobs):
-            row_num   = start + offset + 1
-            row_index = row_num - 1
-            dt        = datetime.strptime(j["collected_at"], "%Y-%m-%d %H:%M:%S")
-            ws.append([
-                row_index,
+        # Clear old data rows (keep header row 1)
+        if ws.max_row > 1:
+            ws.delete_rows(2, ws.max_row)
+
+        rf  = PatternFill("solid", fgColor=SHEET_META["Collected Jobs"]["row_color"])
+
+        for i, j in enumerate(jobs):
+            row_num = i + 2        # row 2 = first data row
+            dt      = datetime.strptime(j["collected_at"], "%Y-%m-%d %H:%M:%S")
+            values  = [
+                i + 1,
                 j["title"],
                 j["company"],
                 j["url"],
@@ -262,9 +266,9 @@ def save_collected_jobs(jobs: list[dict], log: Callable) -> None:
                 dt.strftime("%H:%M:%S"),
                 j.get("status", "Pending"),
                 j.get("notes", ""),
-            ])
-            for col in range(1, 10):
-                ws.cell(row_num, col).fill = rf
+            ]
+            for col, val in enumerate(values, 1):
+                ws.cell(row_num, col, val).fill = rf
 
         wb.save(EXCEL_FILE)
         log(f"[INFO] Collected {len(jobs)} jobs saved → {os.path.abspath(EXCEL_FILE)}")
@@ -649,14 +653,19 @@ class LinkedInBot:
             return False
 
     def _click_easy_apply(self) -> bool:
-        for sel in [
+        selectors = [
             "button.jobs-apply-button",
             "button[aria-label*='Easy Apply']",
             "button[aria-label*='easy apply']",
             ".jobs-s-apply button",
-        ]:
+            "button.jobs-apply-button--top-card",
+            "div.jobs-apply-button--top-card button",
+            "div[class*='apply'] button",
+        ]
+        # First pass — try all selectors with a short wait
+        for sel in selectors:
             try:
-                btn = WebDriverWait(self.driver, 6).until(
+                btn = WebDriverWait(self.driver, 4).until(
                     EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
                 )
                 label = (btn.text or btn.get_attribute("aria-label") or "").lower()
@@ -666,6 +675,23 @@ class LinkedInBot:
                     return True
             except Exception:
                 continue
+
+        # Second pass — scan ALL visible buttons for Easy Apply text
+        try:
+            for btn in self.driver.find_elements(By.TAG_NAME, "button"):
+                if not btn.is_displayed() or not btn.is_enabled():
+                    continue
+                text = (btn.text or "").lower()
+                aria = (btn.get_attribute("aria-label") or "").lower()
+                if "easy apply" in text or "easy apply" in aria:
+                    self.driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});", btn)
+                    time.sleep(0.3)
+                    btn.click()
+                    self._delay(1.5, 3)
+                    return True
+        except Exception:
+            pass
         return False
 
     def _find_btn(self, *fragments: str):
@@ -941,19 +967,44 @@ class LinkedInBot:
                 self._close_modal()
                 self._discard()
                 return False, "stopped by user"
+
             self._delay(1, 2)
+
             # Fill any empty fields on this step before navigating
             self._fill_form_fields()
             self._short()
+
             if self._click_submit():
                 self._delay(1, 2)
                 self._close_modal()
                 return True, ""
+
             if self._click_next_or_review():
                 continue
+
+            # Don't give up immediately — the form/buttons may still be loading.
+            # Wait up to 8 seconds for a Next/Submit/Review button to appear.
+            found_btn = False
+            for _wait in range(8):
+                time.sleep(1)
+                # Re-fill in case new fields appeared while waiting
+                self._fill_form_fields()
+                if self._click_submit():
+                    self._delay(1, 2)
+                    self._close_modal()
+                    return True, ""
+                if self._click_next_or_review():
+                    found_btn = True
+                    break
+            if found_btn:
+                continue
+
+            # Truly no button found after retries — form may be stuck
+            self.log(f"[DEBUG] No nav button found at step {step + 1}, giving up on this job")
             self._close_modal()
             self._discard()
             return False, f"no nav button at step {step + 1}"
+
         self._close_modal()
         self._discard()
         return False, "exceeded max form steps"
@@ -1089,7 +1140,11 @@ class LinkedInBot:
         base_row  = 2
 
         for i, job in enumerate(jobs):
-            if self._should_stop() or self.applied_count >= max_apps:
+            if self._should_stop():
+                self.log("[INFO] Stopped by user.")
+                break
+            if self.applied_count >= max_apps:
+                self.log(f"[INFO] Reached max applications limit ({max_apps}) — stopping.")
                 break
 
             excel_row = base_row + i
@@ -1476,73 +1531,6 @@ class FeedScanner:
             if len(visible) >= 1:
                 return visible
         return []
-
-    def _get_urn(self, post) -> str:
-        """Unique identifier for a post — used to avoid saving duplicates."""
-        for attr in ("data-urn", "data-id"):
-            val = post.get_attribute(attr) or ""
-            if "activity" in val:
-                return val
-        return ""
-
-    def _get_post_url(self, post) -> str:
-        """
-        Build a canonical post URL.
-        LinkedIn feed post permalinks look like:
-        https://www.linkedin.com/feed/update/urn:li:activity:1234567890/
-        """
-        urn = self._get_urn(post)
-        if urn:
-            # Normalise urn:li:ugcPost:... → urn:li:activity:...
-            # (both redirect correctly on LinkedIn)
-            return f"https://www.linkedin.com/feed/update/{urn}/"
-
-        # Fallback: find any feed/update link inside the post
-        try:
-            for a in post.find_elements(By.TAG_NAME, "a"):
-                href = a.get_attribute("href") or ""
-                if "feed/update" in href or "ugcPost" in href:
-                    return href.split("?")[0]
-        except Exception:
-            pass
-        return ""
-
-    def _get_author_name(self, post) -> str:
-        for sel in AUTHOR_NAME_SELECTORS:
-            try:
-                t = post.find_element(By.CSS_SELECTOR, sel).text.strip()
-                if t:
-                    return t
-            except NoSuchElementException:
-                continue
-        return "Unknown Author"
-
-    def _get_author_url(self, post) -> str:
-        for sel in AUTHOR_URL_SELECTORS:
-            try:
-                href = post.find_element(By.CSS_SELECTOR, sel).get_attribute("href") or ""
-                if href:
-                    return href.split("?")[0]
-            except NoSuchElementException:
-                continue
-        return ""
-
-    def _get_post_text(self, post) -> str:
-        for sel in POST_TEXT_SELECTORS:
-            try:
-                t = post.find_element(By.CSS_SELECTOR, sel).text.strip()
-                if len(t) > 20:
-                    return t
-            except NoSuchElementException:
-                continue
-        return ""
-
-    def _keywords_in_text(self, text: str) -> list[str]:
-        lower = text.lower()
-        return [
-            kw for kw in self.config.get("feed_keywords", [])
-            if kw.strip().lower() in lower
-        ]
 
     # ─────────────────────────────────── search
 

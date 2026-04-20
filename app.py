@@ -164,20 +164,31 @@ class LinkedInApp:
     # ──────────────────────────────────────────── ui
 
     def _build_ui(self):
+        # Modern theme
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"),
+                         foreground="#1A237E")
+        style.configure("Sub.TLabel", font=("Segoe UI", 9), foreground="#666")
+        style.configure("StatNum.TLabel", font=("Segoe UI", 22, "bold"))
+
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
 
-        outer = ttk.Frame(self.root, padding=10)
-        outer.grid(row=0, column=0, sticky="nsew")
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(1, weight=1)
+        # ── Header ──
+        hdr = ttk.Frame(self.root, padding=(14, 10, 14, 0))
+        hdr.grid(row=0, column=0, sticky="ew")
+        ttk.Label(hdr, text="LinkedIn Easy Apply Bot",
+                  style="Header.TLabel").pack(side=tk.LEFT)
+        ttk.Label(hdr,
+                  text="  Collect → Apply  |  Form Auto-Fill  |  Feed Scanner",
+                  style="Sub.TLabel").pack(side=tk.LEFT, padx=(10, 0))
 
-        ttk.Label(outer, text="LinkedIn Easy Apply Bot",
-                  font=("Helvetica", 15, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        # ── Notebook ──
+        nb = ttk.Notebook(self.root, padding=4)
+        nb.grid(row=1, column=0, sticky="nsew", padx=10, pady=(6, 0))
 
-        nb = ttk.Notebook(outer)
-        nb.grid(row=1, column=0, sticky="nsew")
-
+        self._tab_dashboard(nb)
         self._tab_settings(nb)
         self._tab_roles(nb)
         self._tab_ignore(nb)
@@ -186,36 +197,92 @@ class LinkedInApp:
         self._tab_feed_scanner(nb)
         self._tab_logs(nb)
 
-        # ── Job bot controls ──────────────────────────────────────
-        job_ctrl = ttk.LabelFrame(outer, text="Job Bot", padding=(8, 4))
-        job_ctrl.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        # ── Status bar ──
+        self.status_var = tk.StringVar(value="Ready")
+        ttk.Label(self.root, textvariable=self.status_var,
+                  relief=tk.SUNKEN, anchor=tk.W, padding=(8, 3)).grid(
+            row=2, column=0, sticky="ew", padx=10, pady=(4, 8))
 
-        self.start_btn = ttk.Button(job_ctrl, text="▶  Collect + Apply",
+    # ── dashboard tab ─────────────────────────────────────────────
+
+    def _tab_dashboard(self, nb):
+        f = ttk.Frame(nb, padding=12)
+        nb.add(f, text="  Dashboard  ")
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(3, weight=1)
+
+        # ── Action buttons ──
+        btn_frame = ttk.LabelFrame(f, text="Controls", padding=(10, 6))
+        btn_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+
+        self.start_btn = ttk.Button(btn_frame, text="▶  Collect + Apply",
                                     command=lambda: self._start(collect_only=False))
         self.start_btn.pack(side=tk.LEFT, padx=(0, 4))
 
-        self.collect_btn = ttk.Button(job_ctrl, text="📋  Collect Only",
+        self.collect_btn = ttk.Button(btn_frame, text="📋  Collect Only",
                                       command=lambda: self._start(collect_only=True))
-        self.collect_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.collect_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.stop_btn = ttk.Button(job_ctrl, text="Stop", command=self._stop, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.stop_btn = ttk.Button(btn_frame, text="⏹  Stop",
+                                   command=self._stop, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=(0, 12))
 
-        self.apply_btn = ttk.Button(job_ctrl, text="Apply Changes Now",
-                                    command=self._apply_changes)
-        self.apply_btn.pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Label(job_ctrl,
-                  text="← push UI changes to running bot without restarting",
-                  foreground="#555555").pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Separator(btn_frame, orient=tk.VERTICAL).pack(
+            side=tk.LEFT, fill=tk.Y, padx=6)
 
-        ttk.Button(job_ctrl, text="Save Config", command=self._save_config).pack(side=tk.LEFT)
-        self.apps_label = ttk.Label(job_ctrl, text="Collected: 0 | Applied: 0",
-                                    font=("Helvetica", 9, "bold"))
-        self.apps_label.pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="Apply Changes Now",
+                   command=self._apply_changes).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(btn_frame, text="Save Config",
+                   command=self._save_config).pack(side=tk.LEFT, padx=(0, 4))
+        self.apps_label = ttk.Label(btn_frame, text="Collected: 0 | Applied: 0",
+                                    font=("Segoe UI", 9, "bold"))
+        self.apps_label.pack(side=tk.RIGHT, padx=(10, 0))
 
-        self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(outer, textvariable=self.status_var,
-                  relief=tk.SUNKEN, anchor=tk.W).grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        # ── Stats row ──
+        stats = ttk.LabelFrame(f, text="Live Statistics", padding=10)
+        stats.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        stats.columnconfigure((0, 1, 2, 3), weight=1)
+
+        self._stat_collected = tk.StringVar(value="0")
+        self._stat_applied   = tk.StringVar(value="0")
+        self._stat_failed    = tk.StringVar(value="0")
+        self._stat_skipped   = tk.StringVar(value="0")
+
+        for col, (lbl, var, clr) in enumerate([
+            ("Collected", self._stat_collected, "#1A237E"),
+            ("Applied",   self._stat_applied,   "#2E7D32"),
+            ("Failed",    self._stat_failed,     "#C62828"),
+            ("Skipped",   self._stat_skipped,    "#E65100"),
+        ]):
+            box = ttk.Frame(stats)
+            box.grid(row=0, column=col, padx=8, sticky="ew")
+            ttk.Label(box, text=lbl, foreground="#666",
+                      font=("Segoe UI", 9)).pack()
+            tk.Label(box, textvariable=var, font=("Segoe UI", 22, "bold"),
+                     fg=clr).pack()
+
+        # ── Progress bar ──
+        prog = ttk.Frame(f)
+        prog.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        prog.columnconfigure(0, weight=1)
+        self.progress = ttk.Progressbar(prog, mode="determinate")
+        self.progress.grid(row=0, column=0, sticky="ew")
+        self.phase_label = ttk.Label(prog, text="", foreground="#555")
+        self.phase_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        # ── Mini activity log ──
+        log_frame = ttk.LabelFrame(f, text="Activity Log", padding=4)
+        log_frame.grid(row=3, column=0, sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.dash_log = scrolledtext.ScrolledText(
+            log_frame, wrap=tk.WORD, state=tk.DISABLED,
+            font=("Consolas", 9), height=8)
+        self.dash_log.grid(row=0, column=0, sticky="nsew")
+        for tag, fg in [("INFO","#1565C0"),("SUCCESS","#2E7D32"),("WARN","#E65100"),
+                        ("ERROR","#C62828"),("COLLECT","#6A1B9A"),("SKIP","#757575"),
+                        ("DONE","#2E7D32"),("DEBUG","#999")]:
+            self.dash_log.tag_config(tag, foreground=fg)
 
     # ── settings tab ──────────────────────────────────────────────
 
@@ -658,7 +725,7 @@ class LinkedInApp:
         ts   = datetime.now().strftime("%H:%M:%S")
         full = f"[{ts}] {msg}\n"
         tag  = "INFO"
-        for t in ("SUCCESS","FOUND","WARN","ERROR","SKIP","DONE","DEBUG","INFO"):
+        for t in ("SUCCESS","FOUND","WARN","ERROR","SKIP","DONE","DEBUG","COLLECT","INFO"):
             if f"[{t}]" in msg:
                 tag = t
                 break
@@ -666,6 +733,13 @@ class LinkedInApp:
         widget.insert(tk.END, full, tag)
         widget.see(tk.END)
         widget.config(state=tk.DISABLED)
+
+        # Mirror job-bot messages to the Dashboard mini-log
+        if kind == "job":
+            self.dash_log.config(state=tk.NORMAL)
+            self.dash_log.insert(tk.END, full, tag)
+            self.dash_log.see(tk.END)
+            self.dash_log.config(state=tk.DISABLED)
 
     def _clear_logs(self):
         self.log_text.config(state=tk.NORMAL)
@@ -696,6 +770,20 @@ class LinkedInApp:
         self.start_btn.config(state=tk.DISABLED)
         self.collect_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
+
+        # Reset dashboard stats for a fresh run
+        self._stat_collected.set("0")
+        self._stat_applied.set("0")
+        self._stat_failed.set("0")
+        self._stat_skipped.set("0")
+        self.progress.stop()
+        self.progress.config(mode="indeterminate", value=0)
+        self.phase_label.config(text="Starting…")
+
+        # Clear dashboard mini-log
+        self.dash_log.config(state=tk.NORMAL)
+        self.dash_log.delete("1.0", tk.END)
+        self.dash_log.config(state=tk.DISABLED)
 
         if collect_only:
             self.status_var.set("Phase 1 — Collecting jobs…")
@@ -733,11 +821,15 @@ class LinkedInApp:
             if self._collect_only_mode:
                 self.apps_label.config(text=f"Collected: {collected}")
             else:
-                # Keep existing applied count; only refresh collected portion
                 cur = self.apps_label.cget("text")
                 applied_part = cur.split("|")[1].strip() if "|" in cur else "Applied: 0"
                 self.apps_label.config(text=f"Collected: {collected} | {applied_part}")
             self.status_var.set(f"Phase 1 — Collecting jobs… ({collected} so far)")
+            # Dashboard stats
+            self._stat_collected.set(str(collected))
+            self.phase_label.config(text="Phase 1 — Collecting job listings…")
+            self.progress.config(mode="indeterminate")
+            self.progress.start(20)
         self.root.after(0, _update)
 
     def _on_apply_update(self, applied: int, total: int):
@@ -747,6 +839,15 @@ class LinkedInApp:
             collected_part = cur.split("|")[0].strip() if "|" in cur else "Collected: ?"
             self.apps_label.config(text=f"{collected_part} | Applied: {applied}/{total}")
             self.status_var.set(f"Phase 2 — Applying… ({applied}/{total})")
+            # Dashboard stats & progress
+            self._stat_applied.set(str(applied))
+            if self.bot:
+                self._stat_failed.set(str(len(self.bot.failed_jobs)))
+                self._stat_skipped.set(str(len(self.bot.ignored_jobs)))
+            self.progress.stop()
+            self.progress.config(mode="determinate", maximum=total, value=applied)
+            pct = int(applied / total * 100) if total else 0
+            self.phase_label.config(text=f"Phase 2 — Applying… {applied}/{total} ({pct}%)")
         self.root.after(0, _update)
 
     def _on_bot_finished(self):
@@ -754,10 +855,29 @@ class LinkedInApp:
         self.start_btn.config(state=tk.NORMAL)
         self.collect_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
+
+        # Stop the indeterminate progress animation if still running
+        self.progress.stop()
+
+        if self.bot:
+            self._stat_applied.set(str(self.bot.applied_count))
+            self._stat_failed.set(str(len(self.bot.failed_jobs)))
+            self._stat_skipped.set(str(len(self.bot.ignored_jobs)))
+            total = self.bot._total_to_apply or 1
+            self.progress.config(mode="determinate", maximum=total,
+                                 value=self.bot.applied_count)
+
         if self._collect_only_mode:
             self.status_var.set("Collect phase complete — check linkedin_jobs.xlsx")
+            self.phase_label.config(text="✔ Collection finished")
         else:
-            self.status_var.set("Finished")
+            applied = self.bot.applied_count if self.bot else 0
+            failed  = len(self.bot.failed_jobs) if self.bot else 0
+            skipped = len(self.bot.ignored_jobs) if self.bot else 0
+            self.status_var.set(
+                f"Finished — {applied} applied, {failed} failed, {skipped} skipped")
+            self.phase_label.config(
+                text=f"✔ Done — {applied} applied, {failed} failed, {skipped} skipped")
 
     # ──────────────────────────────────────────── feed scanner
 
