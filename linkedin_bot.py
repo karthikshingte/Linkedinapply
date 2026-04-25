@@ -528,16 +528,169 @@ class LinkedInBot:
         return ""
 
     def _get_detail_text(self) -> str:
-        for sel in [
+        """
+        Read the full 'About the job' description.
+
+        Strategy (most robust → least):
+          1. CSS selectors with wildcards (survive class-name changes)
+          2. JavaScript scan — finds the div/section with the most text on the page
+             that isn't a nav/header/footer (works regardless of class names)
+          3. Click any 'See more' button and re-read
+          4. Full page body text as absolute last resort
+          5. Screenshot + log on failure so you can see what LinkedIn looks like
+        """
+        # Give the page a moment to finish rendering after navigation
+        time.sleep(1.5)
+
+        # ── Step 1: wildcard CSS selectors (class names change, but keywords survive) ──
+        WILDCARD_SELECTORS = [
+            # id-based (most stable — LinkedIn rarely changes IDs)
+            "div#job-details",
+            "div#jobDescriptionText",
+            # class wildcards
+            "div[class*='description-content']",
+            "div[class*='job-description']",
+            "div[class*='jobs-description']",
+            "div[class*='description__text']",
+            "div[class*='jobs-box']",
+            "div[class*='job-details']",
+            "section[class*='description']",
+            "article[class*='description']",
+            # common stable selectors still worth trying
             "div.jobs-description",
-            "div.jobs-unified-top-card",
-            "div.job-details-jobs-unified-top-card__job-insight",
             "div.jobs-details",
-        ]:
+            "div.description__text",
+        ]
+
+        best_css = ""
+        container_el = None
+        for sel in WILDCARD_SELECTORS:
             try:
-                return self.driver.find_element(By.CSS_SELECTOR, sel).text.lower()
-            except NoSuchElementException:
+                el = self.driver.find_element(By.CSS_SELECTOR, sel)
+                text = el.text.strip()
+                if len(text) > len(best_css):
+                    best_css = text
+                    container_el = el
+            except Exception:
                 continue
+
+        # ── Step 2: JavaScript deep-scan — find the element with the most text ──
+        # This works even when ALL class names are new/unknown
+        js_text = ""
+        try:
+            js_text = self.driver.execute_script("""
+                var candidates = document.querySelectorAll(
+                    'div, section, article, main'
+                );
+                var best = '';
+                var skip_tags = new Set(['SCRIPT','STYLE','NAV','HEADER','FOOTER']);
+                for (var i = 0; i < candidates.length; i++) {
+                    var el = candidates[i];
+                    // Skip elements that contain many direct children
+                    // (those are layout containers, not content blocks)
+                    if (el.children.length > 40) continue;
+                    // Skip navigation / chrome elements
+                    if (skip_tags.has(el.tagName)) continue;
+                    var t = (el.innerText || '').trim();
+                    // Only consider blocks that look like job descriptions
+                    // (more than 200 chars, not just a header)
+                    if (t.length > 200 && t.length > best.length) {
+                        best = t;
+                    }
+                }
+                return best;
+            """) or ""
+        except Exception:
+            pass
+
+        # Pick whichever gave more text so far
+        current_best = js_text if len(js_text) > len(best_css) else best_css
+
+        # ── Step 3: click 'See more' if visible, then re-read ──
+        clicked_see_more = False
+        try:
+            # Scroll the container into view first
+            if container_el:
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", container_el)
+                time.sleep(0.8)
+            else:
+                # Scroll halfway down the page to reveal description area
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 2);")
+                time.sleep(0.8)
+
+            # Find 'See more' by scanning all buttons + spans for the text
+            for el in self.driver.find_elements(By.CSS_SELECTOR,
+                    "button, span[role='button'], a[role='button']"):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    el_text = (
+                        el.text
+                        or el.get_attribute("aria-label")
+                        or el.get_attribute("innerHTML")
+                        or ""
+                    ).strip().lower()
+                    if any(f in el_text for f in ("see more", "show more", "...more")):
+                        self.driver.execute_script(
+                            "arguments[0].scrollIntoView({block:'center'});", el)
+                        time.sleep(0.3)
+                        el.click()
+                        clicked_see_more = True
+                        self.log("[DEBUG] Clicked 'See more' to expand job description.")
+                        time.sleep(1.5)
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Re-read after expanding
+        if clicked_see_more:
+            expanded_js = ""
+            try:
+                expanded_js = self.driver.execute_script("""
+                    var candidates = document.querySelectorAll('div, section, article');
+                    var best = '';
+                    for (var i = 0; i < candidates.length; i++) {
+                        var el = candidates[i];
+                        if (el.children.length > 40) continue;
+                        var t = (el.innerText || '').trim();
+                        if (t.length > 200 && t.length > best.length) best = t;
+                    }
+                    return best;
+                """) or ""
+            except Exception:
+                pass
+            if len(expanded_js) > len(current_best):
+                current_best = expanded_js
+
+        # ── Step 4: return what we have if it's substantial ──
+        if len(current_best) > 100:
+            self.log(f"[DEBUG] Description length: {len(current_best)} chars")
+            return current_best.lower()
+
+        # ── Step 5: absolute fallback — full page body text ──
+        # Messy but contains the description; better than skipping the job entirely
+        try:
+            body_text = self.driver.execute_script(
+                "return document.body.innerText || '';"
+            ).strip()
+            if len(body_text) > 200:
+                self.log(f"[DEBUG] Using full page body text ({len(body_text)} chars) as fallback.")
+                return body_text.lower()
+        except Exception:
+            pass
+
+        # ── Step 6: screenshot so you can see what LinkedIn is actually showing ──
+        try:
+            fname = "debug_no_description.png"
+            self.driver.save_screenshot(fname)
+            self.log(f"[WARN] Could not read job description — screenshot saved → {fname}")
+            self.log(f"[WARN] Page URL: {self.driver.current_url}")
+            self.log(f"[WARN] Page title: {self.driver.title}")
+        except Exception:
+            self.log("[WARN] Could not read job description — keyword check will use title only.")
         return ""
 
     # ─────────────────────────────────── filtering logic
@@ -1128,10 +1281,21 @@ class LinkedInBot:
 
             self.log(f"\n[INFO] ── Applying {i+1}/{total}: {title} @ {company}")
 
-            # ── CHANGE 4: Navigate to job page + detect split-pane redirect ──
+            # ── Navigate to job page, wait for content, handle split-pane redirect ──
             try:
                 self.driver.get(url)
-                self._delay(2, 4)
+                # Wait for ANY substantial content to appear on the page
+                # before we try to read the description
+                try:
+                    WebDriverWait(self.driver, 12).until(
+                        lambda d: len(d.execute_script(
+                            "return document.body.innerText || '';"
+                        ).strip()) > 300
+                    )
+                except TimeoutException:
+                    pass
+                self._delay(2, 3)
+
                 # Detect LinkedIn's split-pane redirect and scroll the detail panel into view
                 current_url = self.driver.current_url
                 if "currentJobId" in current_url and "/jobs/search/" in current_url:
@@ -1140,7 +1304,8 @@ class LinkedInBot:
                         detail = WebDriverWait(self.driver, 8).until(
                             EC.presence_of_element_located(
                                 (By.CSS_SELECTOR,
-                                 "div.jobs-details, div.job-view-layout, div.jobs-unified-top-card")
+                                 "div.jobs-details, div.job-view-layout, "
+                                 "div.jobs-unified-top-card, div[class*='job']")
                             )
                         )
                         self.driver.execute_script(
@@ -1592,19 +1757,67 @@ class FeedScanner:
         return ""
 
     def _get_post_text(self, post) -> str:
+        """
+        Read the full text of a feed post card.
+        Steps:
+          1. Try to click the 'see more' / '...more' link inside the card
+             so the collapsed portion expands before reading
+          2. Read text using known selectors, return the longest result
+          3. Fall back to the card's full .text if selectors miss
+        """
+
+        # ── Step 1: click 'see more' inside this specific post card ──
+        SEE_MORE_FRAGMENTS = ("see more", "...more", "show more", "more", "expand")
+        try:
+            # Scope search to THIS card only so we don't click a different post's button
+            card_buttons = post.find_elements(By.TAG_NAME, "button")
+            card_spans   = post.find_elements(By.CSS_SELECTOR,
+                "span.see-more, button.see-more, "
+                "span[class*='see-more'], button[class*='see-more'], "
+                "span.feed-shared-inline-show-more-text__see-more-less-toggle, "
+                "button.feed-shared-text-view__see-more, "
+                "a[class*='see-more']"
+            )
+            candidates = card_buttons + card_spans
+            for el in candidates:
+                try:
+                    if not el.is_displayed():
+                        continue
+                    el_text = (el.text or el.get_attribute("aria-label") or "").strip().lower()
+                    if any(f in el_text for f in SEE_MORE_FRAGMENTS):
+                        self.driver.execute_script(
+                            "arguments[0].scrollIntoView({block:'center'});", el)
+                        time.sleep(0.3)
+                        el.click()
+                        time.sleep(1.2)   # wait for full text to render
+                        self.log("[DEBUG] Clicked post 'see more' to expand full text.")
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # ── Step 2: read text with known selectors, keep the longest ──
+        best = ""
         for sel in POST_TEXT_SELECTORS:
             try:
                 t = post.find_element(By.CSS_SELECTOR, sel).text.strip()
-                if len(t) > 20:
-                    return t
+                if len(t) > len(best):
+                    best = t
             except NoSuchElementException:
                 continue
+
+        if len(best) > 20:
+            return best
+
+        # ── Step 3: full card text fallback ──
         try:
             t = post.text.strip()
             if len(t) > 20:
                 return t
         except Exception:
             pass
+
         return ""
 
     def _keywords_in_text(self, text: str) -> list[str]:
