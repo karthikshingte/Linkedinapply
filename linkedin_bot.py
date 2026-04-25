@@ -83,14 +83,12 @@ PAGE_READY_SELECTORS = [
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _build_search_url(role: str, location: str, date_posted: str, experience: str) -> str:
-    # Wrap role in quotes → LinkedIn treats it as an exact job-title phrase,
-    # not a general keyword search, giving far more targeted results.
     quoted = f'%22{role.replace(" ", "%20")}%22'
     params = [
         f"keywords={quoted}",
         f"location={location.replace(' ', '%20')}",
-        "f_LF=f_AL",   # Easy Apply only
-        "sortBy=DD",    # most recent first
+        "f_LF=f_AL",
+        "sortBy=DD",
     ]
     dc = DATE_FILTER_MAP.get(date_posted, "")
     if dc:
@@ -102,13 +100,6 @@ def _build_search_url(role: str, location: str, date_posted: str, experience: st
 
 
 def _job_id_from_url(url: str) -> str:
-    """
-    Extract the numeric LinkedIn job ID for deduplication.
-    Handles two URL formats LinkedIn uses:
-      - /jobs/view/1234567890/          (direct job page)
-      - ?currentJobId=1234567890        (split-pane search view)
-    Returns "" if no ID found — an empty string never matches anything.
-    """
     if not url:
         return ""
     m = re.search(r"/jobs/view/(\d+)", url)
@@ -117,15 +108,10 @@ def _job_id_from_url(url: str) -> str:
     m = re.search(r"currentJobId=(\d+)", url)
     if m:
         return m.group(1)
-    return ""   # unknown — do NOT fall back to the URL itself
+    return ""
 
 
 def _clean_job_url(raw_url: str) -> str:
-    """
-    Convert any LinkedIn job URL variant into a clean, canonical form:
-    https://www.linkedin.com/jobs/view/JOBID/
-    Falls back to the stripped URL if no job ID can be extracted.
-    """
     job_id = _job_id_from_url(raw_url)
     if job_id:
         return f"https://www.linkedin.com/jobs/view/{job_id}/"
@@ -137,7 +123,6 @@ def _clean_job_url(raw_url: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 SHEET_META = {
-    # Pipeline sheet — written at end of collection phase, status updated during apply phase
     "Collected Jobs": {
         "headers":   ["#", "Job Title", "Company", "URL", "Role Searched",
                       "Collected Date", "Collected Time", "Status", "Notes"],
@@ -204,10 +189,6 @@ def _load_or_create_workbook() -> "openpyxl.Workbook":
 
 
 def load_applied_job_ids(log: Callable) -> set:
-    """
-    Read linkedin_jobs.xlsx and return the set of already-applied LinkedIn job IDs.
-    Called once at bot startup so we never re-apply to a previously applied job.
-    """
     ids: set[str] = set()
     if not EXCEL_OK or not os.path.exists(EXCEL_FILE):
         return ids
@@ -219,7 +200,7 @@ def load_applied_job_ids(log: Callable) -> set:
                 url_cell = row[3] if len(row) > 3 else None
                 if url_cell:
                     jid = _job_id_from_url(str(url_cell))
-                    if jid:          # never add empty string
+                    if jid:
                         ids.add(jid)
         wb.close()
         if ids:
@@ -232,12 +213,6 @@ def load_applied_job_ids(log: Callable) -> set:
 
 
 def save_collected_jobs(jobs: list[dict], log: Callable) -> None:
-    """
-    Write the collected-jobs pipeline to the 'Collected Jobs' sheet.
-    Called at the end of Phase 1.  **Clears old data** so the sheet always
-    reflects the current run and row numbers match what _apply_phase expects
-    (job 0 → Excel row 2, job 1 → row 3, etc.).
-    """
     if not EXCEL_OK:
         log("[WARN] openpyxl not installed — cannot save collected jobs.")
         return
@@ -246,15 +221,11 @@ def save_collected_jobs(jobs: list[dict], log: Callable) -> None:
     try:
         wb  = _load_or_create_workbook()
         ws  = _ensure_sheet(wb, "Collected Jobs")
-
-        # Clear old data rows (keep header row 1)
         if ws.max_row > 1:
             ws.delete_rows(2, ws.max_row)
-
         rf  = PatternFill("solid", fgColor=SHEET_META["Collected Jobs"]["row_color"])
-
         for i, j in enumerate(jobs):
-            row_num = i + 2        # row 2 = first data row
+            row_num = i + 2
             dt      = datetime.strptime(j["collected_at"], "%Y-%m-%d %H:%M:%S")
             values  = [
                 i + 1,
@@ -269,7 +240,6 @@ def save_collected_jobs(jobs: list[dict], log: Callable) -> None:
             ]
             for col, val in enumerate(values, 1):
                 ws.cell(row_num, col, val).fill = rf
-
         wb.save(EXCEL_FILE)
         log(f"[INFO] Collected {len(jobs)} jobs saved → {os.path.abspath(EXCEL_FILE)}")
     except Exception as e:
@@ -277,14 +247,8 @@ def save_collected_jobs(jobs: list[dict], log: Callable) -> None:
 
 
 def update_collected_status(excel_row: int, status: str, notes: str, log: Callable) -> None:
-    """
-    Update a single row in 'Collected Jobs' sheet with a new status and notes.
-    excel_row is 1-based (2 = first data row).
-    Called after each apply attempt in Phase 2 so progress is visible in real time.
-    """
     if not EXCEL_OK or not os.path.exists(EXCEL_FILE):
         return
-    # Status = col 8, Notes = col 9
     STATUS_COL = 8
     NOTES_COL  = 9
     STATUS_COLORS = {
@@ -320,40 +284,33 @@ def update_excel(
     if not (applied or ignored or failed):
         log("[INFO] Nothing new to save to Excel.")
         return
-
     try:
         wb = _load_or_create_workbook()
-
         for sheet_name, jobs in [("Applied", applied), ("Ignored", ignored), ("Failed", failed)]:
             if not jobs:
                 continue
             ws    = _ensure_sheet(wb, sheet_name)
-            start = ws.max_row      # 1 = header only → next data row = 2
+            start = ws.max_row
             rf    = PatternFill("solid", fgColor=SHEET_META[sheet_name]["row_color"])
-
             for offset, j in enumerate(jobs):
                 row_num    = start + offset + 1
-                row_index  = row_num - 1          # sequential # ignoring header
+                row_index  = row_num - 1
                 dt         = datetime.strptime(j["timestamp"], "%Y-%m-%d %H:%M:%S")
                 date_str   = dt.strftime("%Y-%m-%d")
                 time_str   = dt.strftime("%H:%M:%S")
-
                 if sheet_name == "Applied":
                     values = [row_index, j["title"], j["company"], j["url"],
                               date_str, time_str, j.get("role", "")]
                 else:
                     values = [row_index, j["title"], j["company"], j["url"],
                               date_str, time_str, j.get("reason", "")]
-
                 ws.append(values)
                 for col_idx in range(1, len(values) + 1):
                     ws.cell(row_num, col_idx).fill = rf
-
         wb.save(EXCEL_FILE)
         path = os.path.abspath(EXCEL_FILE)
         log(f"[INFO] Excel updated: {path}  "
             f"(+{len(applied)} applied, +{len(ignored)} ignored, +{len(failed)} failed)")
-
     except Exception as e:
         log(f"[ERROR] Could not update Excel: {e}")
 
@@ -373,20 +330,18 @@ class LinkedInBot:
     ):
         self.config           = config
         self.log              = log
-        self.collect_callback = collect_callback  # (collected_count)
-        self.apply_callback   = apply_callback    # (applied_count, total_jobs)
+        self.collect_callback = collect_callback
+        self.apply_callback   = apply_callback
         self.driver: webdriver.Chrome | None = None
         self.wait:   WebDriverWait    | None = None
         self._stop_flag       = False
         self.applied_count    = 0
-        self._total_to_apply  = 0   # set at start of Phase 2
+        self._total_to_apply  = 0
 
-        # Per-run job lists
         self.applied_jobs: list[dict] = []
         self.ignored_jobs: list[dict] = []
         self.failed_jobs:  list[dict] = []
 
-        # Loaded from Excel before run starts
         self._applied_ids: set[str] = set()
 
     # ─────────────────────────────────── control
@@ -413,7 +368,6 @@ class LinkedInBot:
         opts = Options()
         if self.config.get("headless", False):
             opts.add_argument("--headless=new")
-
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--disable-blink-features=AutomationControlled")
@@ -425,13 +379,11 @@ class LinkedInBot:
             "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
-
         if USE_WDM:
             service = Service(ChromeDriverManager().install())
             self.driver = webdriver.Chrome(service=service, options=opts)
         else:
             self.driver = webdriver.Chrome(options=opts)
-
         self.driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
@@ -445,7 +397,6 @@ class LinkedInBot:
         self.log("[INFO] Opening LinkedIn login page...")
         self.driver.get("https://www.linkedin.com/login")
         self._delay(2, 4)
-
         try:
             email_f = self.wait.until(EC.presence_of_element_located((By.ID, "username")))
             self._type_human(email_f, self.config["email"])
@@ -510,14 +461,12 @@ class LinkedInBot:
     def _get_job_cards(self) -> list:
         self._wait_for_page_ready()
         time.sleep(1.5)
-
         for sel in CARD_SELECTORS:
             cards   = self.driver.find_elements(By.CSS_SELECTOR, sel)
             visible = [c for c in cards if c.is_displayed()]
             if len(visible) > 1:
                 self.log(f"[DEBUG] {len(visible)} cards  ({sel})")
                 return visible
-
         self.log(f"[DEBUG] No cards found — page title: '{self.driver.title}'")
         self.log(f"[DEBUG] URL: {self.driver.current_url}")
         return []
@@ -558,12 +507,6 @@ class LinkedInBot:
         return "Unknown Company"
 
     def _get_url(self, card) -> str:
-        """
-        Get the job URL from the card's anchor tag href.
-        Card hrefs always contain /jobs/view/JOBID/ so we can extract the ID
-        BEFORE clicking — avoiding the split-pane currentJobId problem entirely.
-        Returns "" if not found (caller must handle).
-        """
         for sel in [
             "a.job-card-list__title--link",
             "a.job-card-list__title",
@@ -576,7 +519,6 @@ class LinkedInBot:
                     return _clean_job_url(href)
             except NoSuchElementException:
                 continue
-        # Try the data attribute on the card itself
         try:
             jid = card.get_attribute("data-occludable-job-id") or card.get_attribute("data-job-id")
             if jid:
@@ -586,7 +528,6 @@ class LinkedInBot:
         return ""
 
     def _get_detail_text(self) -> str:
-        """Read the job detail panel text after clicking a card."""
         for sel in [
             "div.jobs-description",
             "div.jobs-unified-top-card",
@@ -602,7 +543,6 @@ class LinkedInBot:
     # ─────────────────────────────────── filtering logic
 
     def _check_ignore(self, title: str) -> tuple[bool, str]:
-        """Returns (should_skip, matched_word)."""
         lower = title.lower()
         for word in self.config.get("ignore_words", []):
             if word.strip().lower() in lower:
@@ -610,11 +550,6 @@ class LinkedInBot:
         return False, ""
 
     def _check_role_match(self, title: str) -> bool:
-        """
-        If strict_role_match is on, skip any job whose title contains none
-        of the keywords derived from the user's job_roles list.
-        Splits each role into words >3 chars and checks any of them.
-        """
         if not self.config.get("strict_role_match", True):
             return True
         title_lower = title.lower()
@@ -625,11 +560,6 @@ class LinkedInBot:
         return False
 
     def _check_job_type(self, title: str, detail_text: str) -> tuple[bool, str]:
-        """
-        If job_type_keywords list is non-empty, at least one keyword must appear
-        in the title or job detail text.
-        Returns (passes, matched_keyword_or_reason).
-        """
         required = [k.strip() for k in self.config.get("job_type_keywords", []) if k.strip()]
         if not required:
             return True, ""
@@ -652,71 +582,137 @@ class LinkedInBot:
             self.log(f"[WARN] Could not click card: {e}")
             return False
 
+    # ── CHANGE 1: _click_easy_apply — checks outerHTML, adds screenshot on failure ──
     def _click_easy_apply(self) -> bool:
+        # Give the detail panel extra time to fully render before scanning
+        time.sleep(2.5)
+
         selectors = [
-            "button.jobs-apply-button",
             "button[aria-label*='Easy Apply']",
             "button[aria-label*='easy apply']",
-            ".jobs-s-apply button",
+            ".jobs-apply-button",
+            "div.jobs-s-apply button",
             "button.jobs-apply-button--top-card",
             "div.jobs-apply-button--top-card button",
             "div[class*='apply'] button",
         ]
-        # First pass — try all selectors with a short wait
+
+        # First pass — try CSS selectors
         for sel in selectors:
             try:
-                btn = WebDriverWait(self.driver, 4).until(
+                btn = WebDriverWait(self.driver, 5).until(
                     EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
                 )
                 label = (btn.text or btn.get_attribute("aria-label") or "").lower()
                 if "easy apply" in label:
+                    self.driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});", btn)
+                    time.sleep(0.5)
                     btn.click()
                     self._delay(1.5, 3)
                     return True
             except Exception:
                 continue
 
-        # Second pass — scan ALL visible buttons for Easy Apply text
+        # Second pass — scan every button's full outer HTML
+        # (catches aria-labels inside child spans that .text misses)
         try:
             for btn in self.driver.find_elements(By.TAG_NAME, "button"):
-                if not btn.is_displayed() or not btn.is_enabled():
+                try:
+                    if not btn.is_displayed() or not btn.is_enabled():
+                        continue
+                    outer = (btn.get_attribute("outerHTML") or "").lower()
+                    if "easy apply" in outer:
+                        self.driver.execute_script(
+                            "arguments[0].scrollIntoView({block:'center'});", btn)
+                        time.sleep(0.4)
+                        btn.click()
+                        self._delay(1.5, 3)
+                        return True
+                except StaleElementReferenceException:
                     continue
-                text = (btn.text or "").lower()
-                aria = (btn.get_attribute("aria-label") or "").lower()
-                if "easy apply" in text or "easy apply" in aria:
-                    self.driver.execute_script(
-                        "arguments[0].scrollIntoView({block:'center'});", btn)
-                    time.sleep(0.3)
-                    btn.click()
-                    self._delay(1.5, 3)
-                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Debug screenshot so you can see exactly what is on the page
+        try:
+            self.driver.save_screenshot("debug_no_easy_apply.png")
+            self.log("[DEBUG] No Easy Apply button found — screenshot saved → debug_no_easy_apply.png")
         except Exception:
             pass
         return False
 
+    # ── CHANGE 2: _find_btn — scopes to modal, checks innerHTML, handles stale elements ──
     def _find_btn(self, *fragments: str):
-        for btn in self.driver.find_elements(By.TAG_NAME, "button"):
-            if not btn.is_displayed():
+        # Try to scope search inside the Easy Apply modal first, fall back to full page
+        search_root = self.driver
+        for modal_sel in [
+            "div.jobs-easy-apply-modal",
+            "div[data-test-modal]",
+            "div[role='dialog']",
+            "footer",
+        ]:
+            try:
+                modal = self.driver.find_element(By.CSS_SELECTOR, modal_sel)
+                if modal.is_displayed():
+                    search_root = modal
+                    break
+            except Exception:
                 continue
-            label = (btn.get_attribute("aria-label") or "").lower()
-            text  = (btn.text or "").lower()
-            for f in fragments:
-                if f.lower() in label or f.lower() in text:
-                    return btn
+
+        try:
+            buttons = search_root.find_elements(By.TAG_NAME, "button")
+        except Exception:
+            buttons = self.driver.find_elements(By.TAG_NAME, "button")
+
+        for btn in buttons:
+            try:
+                if not btn.is_displayed():
+                    continue
+                label = (btn.get_attribute("aria-label") or "").lower()
+                text  = (btn.text or "").lower()
+                inner = (btn.get_attribute("innerHTML") or "").lower()
+                for f in fragments:
+                    fl = f.lower()
+                    if fl in label or fl in text or fl in inner:
+                        return btn
+            except StaleElementReferenceException:
+                continue
+            except Exception:
+                continue
         return None
 
+    # ── CHANGE 3: _click_next_or_review — logs validation errors, scrolls before click ──
     def _click_next_or_review(self) -> bool:
         btn = self._find_btn(
             "continue to next step", "next step", "next",
             "review your application", "review",
+            "Continue to next step",
+            "Submit application",
         )
-        if btn and btn.is_enabled():
+        if btn:
             try:
+                if not btn.is_enabled():
+                    # Log any visible validation errors that are blocking the Next button
+                    try:
+                        errors = self.driver.find_elements(
+                            By.CSS_SELECTOR, ".artdeco-inline-feedback--error")
+                        if errors:
+                            self.log(f"[WARN] Form validation error blocking Next: "
+                                     f"{errors[0].text[:100]}")
+                    except Exception:
+                        pass
+                    return False
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", btn)
+                time.sleep(0.3)
                 btn.click()
                 self._delay(1.5, 2.5)
                 return True
-            except Exception:
-                pass
+            except Exception as e:
+                self.log(f"[DEBUG] Next button click error: {e}")
         return False
 
     def _click_submit(self) -> bool:
@@ -759,7 +755,6 @@ class LinkedInBot:
     # ─────────────────────────────────── form auto-fill
 
     def _get_label_text(self, element) -> str:
-        """Return the question/label text associated with a form element."""
         v = (element.get_attribute("aria-label") or "").strip()
         if v:
             return v
@@ -772,15 +767,12 @@ class LinkedInBot:
             except Exception:
                 pass
         try:
-            return element.find_element(
-                By.XPATH, "..//label"
-            ).text.strip()
+            return element.find_element(By.XPATH, "..//label").text.strip()
         except Exception:
             pass
         return (element.get_attribute("placeholder") or "").strip()
 
     def _map_answer(self, label: str, answers: dict) -> str:
-        """Map a question label to a user-configured answer string."""
         lbl = label.lower()
         if any(w in lbl for w in ("phone", "mobile", "telephone")):
             return answers.get("phone", "")
@@ -815,7 +807,7 @@ class LinkedInBot:
                     continue
                 current = (inp.get_attribute("value") or "").strip()
                 if current and current not in ("0",):
-                    continue  # already filled
+                    continue
                 label = self._get_label_text(inp)
                 value = self._map_answer(label, answers)
                 if value:
@@ -826,7 +818,6 @@ class LinkedInBot:
             pass
 
     def _select_best_option(self, sel_obj, target: str):
-        """Pick the select option whose text best matches target."""
         if not target:
             return
         t = target.lower()
@@ -857,7 +848,7 @@ class LinkedInBot:
                 current = s.first_selected_option.text.strip().lower()
                 if current not in ("select an option", "please select", "", "select", "-",
                                    "-- select --", "choose an option"):
-                    continue  # already has a selection
+                    continue
                 lbl = self._get_label_text(sel_el).lower()
                 if any(w in lbl for w in ("education", "degree", "qualification")):
                     self._select_best_option(s, answers.get("education_level", "Bachelor's Degree"))
@@ -870,7 +861,6 @@ class LinkedInBot:
                 elif any(w in lbl for w in ("employment type", "job type", "work type")):
                     self._select_best_option(s, answers.get("work_type", "Full-time"))
                 else:
-                    # Default: pick first non-empty option
                     try:
                         for opt in s.options[1:]:
                             if opt.text.strip():
@@ -951,7 +941,6 @@ class LinkedInBot:
             pass
 
     def _fill_form_fields(self):
-        """Fill any empty required fields on the current form step."""
         answers = self.config.get("form_answers", {})
         try:
             self._fill_text_inputs(answers)
@@ -969,8 +958,6 @@ class LinkedInBot:
                 return False, "stopped by user"
 
             self._delay(1, 2)
-
-            # Fill any empty fields on this step before navigating
             self._fill_form_fields()
             self._short()
 
@@ -982,12 +969,9 @@ class LinkedInBot:
             if self._click_next_or_review():
                 continue
 
-            # Don't give up immediately — the form/buttons may still be loading.
-            # Wait up to 8 seconds for a Next/Submit/Review button to appear.
             found_btn = False
             for _wait in range(8):
                 time.sleep(1)
-                # Re-fill in case new fields appeared while waiting
                 self._fill_form_fields()
                 if self._click_submit():
                     self._delay(1, 2)
@@ -999,7 +983,6 @@ class LinkedInBot:
             if found_btn:
                 continue
 
-            # Truly no button found after retries — form may be stuck
             self.log(f"[DEBUG] No nav button found at step {step + 1}, giving up on this job")
             self._close_modal()
             self._discard()
@@ -1043,13 +1026,6 @@ class LinkedInBot:
     # ─────────────────────────────────── Phase 1 — collect
 
     def _collect_phase(self) -> list[dict]:
-        """
-        Fast collection pass — only reads job card metadata (title, company, URL).
-        Never clicks into a job detail page.
-        Applies: already-applied check, ignore list, strict role match.
-        Job-type keyword check is deferred to Phase 2 (needs the detail page).
-        Returns a list of job dicts with status='Pending'.
-        """
         collected: list[dict] = []
         seen_ids:  set[str]   = set()
         roles = self.config.get("job_roles", [])
@@ -1130,13 +1106,8 @@ class LinkedInBot:
     # ─────────────────────────────────── Phase 2 — apply
 
     def _apply_phase(self, jobs: list[dict]) -> None:
-        """
-        Application pass — navigates to each collected job URL directly.
-        No search-page scraping. Updates Excel row status after every attempt.
-        """
         max_apps  = int(self.config.get("max_applications", 50))
         self._total_to_apply = len(jobs)
-        # jobs[0] is at Excel row 2 (header = row 1)
         base_row  = 2
 
         for i, job in enumerate(jobs):
@@ -1157,10 +1128,26 @@ class LinkedInBot:
 
             self.log(f"\n[INFO] ── Applying {i+1}/{total}: {title} @ {company}")
 
-            # Navigate directly to the job page — no re-scraping
+            # ── CHANGE 4: Navigate to job page + detect split-pane redirect ──
             try:
                 self.driver.get(url)
                 self._delay(2, 4)
+                # Detect LinkedIn's split-pane redirect and scroll the detail panel into view
+                current_url = self.driver.current_url
+                if "currentJobId" in current_url and "/jobs/search/" in current_url:
+                    self.log(f"[DEBUG] Split-pane redirect detected, scrolling detail panel...")
+                    try:
+                        detail = WebDriverWait(self.driver, 8).until(
+                            EC.presence_of_element_located(
+                                (By.CSS_SELECTOR,
+                                 "div.jobs-details, div.job-view-layout, div.jobs-unified-top-card")
+                            )
+                        )
+                        self.driver.execute_script(
+                            "arguments[0].scrollIntoView({block:'start'});", detail)
+                        time.sleep(1.5)
+                    except Exception:
+                        pass
             except Exception as e:
                 self.log(f"[WARN] Could not load job page: {e}")
                 job["status"] = "Failed"
@@ -1168,7 +1155,6 @@ class LinkedInBot:
                 update_collected_status(excel_row, "Failed", "page load error", self.log)
                 continue
 
-            # Resolve URL in case of redirect (LinkedIn might use currentJobId)
             final_url = _clean_job_url(self.driver.current_url)
             job_id    = _job_id_from_url(final_url)
             if job_id and job_id in self._applied_ids:
@@ -1177,7 +1163,6 @@ class LinkedInBot:
                 update_collected_status(excel_row, "Already Applied", "", self.log)
                 continue
 
-            # Job-type keyword check (needs page content)
             detail_text       = self._get_detail_text()
             type_ok, type_why = self._check_job_type(title, detail_text)
             if not type_ok:
@@ -1230,14 +1215,6 @@ class LinkedInBot:
     # ─────────────────────────────────── main run
 
     def run(self, collect_only: bool = False):
-        """
-        Two-phase execution:
-          Phase 1 — Collect: scrape all matching job cards (fast, no detail clicks).
-                              Save to 'Collected Jobs' sheet in linkedin_jobs.xlsx.
-          Phase 2 — Apply:   navigate to each URL directly and apply.
-                              Update status in Excel row-by-row as we go.
-        Pass collect_only=True to stop after Phase 1 (no applications made).
-        """
         try:
             self._setup_driver()
             if not self._login():
@@ -1245,7 +1222,6 @@ class LinkedInBot:
 
             self._applied_ids = load_applied_job_ids(self.log)
 
-            # ── Phase 1 ──────────────────────────────────────────
             self.log("\n[INFO] ═══ PHASE 1 — Collecting jobs ═══")
             collected = self._collect_phase()
 
@@ -1259,7 +1235,6 @@ class LinkedInBot:
                     self.log("[INFO] Nothing to apply to.")
                 return
 
-            # ── Phase 2 ──────────────────────────────────────────
             self.log(f"\n[INFO] ═══ PHASE 2 — Applying to {len(collected)} jobs ═══")
             self._apply_phase(collected)
 
@@ -1313,7 +1288,6 @@ def update_feed_excel(posts: list[dict], log: Callable) -> None:
     if not posts:
         log("[INFO] No new feed posts to save.")
         return
-
     try:
         if os.path.exists(FEED_EXCEL_FILE):
             wb = openpyxl.load_workbook(FEED_EXCEL_FILE)
@@ -1349,7 +1323,7 @@ def update_feed_excel(posts: list[dict], log: Callable) -> None:
                 p.get("author", ""),
                 p.get("author_url", ""),
                 p.get("post_url", ""),
-                p.get("preview", "")[:300],   # cap at 300 chars
+                p.get("preview", "")[:300],
                 p.get("keywords_found", ""),
                 dt.strftime("%Y-%m-%d"),
                 dt.strftime("%H:%M:%S"),
@@ -1368,18 +1342,6 @@ def update_feed_excel(posts: list[dict], log: Callable) -> None:
 # Feed Scanner
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ── Post result containers (tried in order for both search and feed pages) ──
-POST_CONTAINER_SELECTORS = [
-    # LinkedIn content/post search results page
-    "li.reusable-search__result-container",
-    "div.search-results__list > li",
-    # Feed page fallback
-    "div.feed-shared-update-v2",
-    "div[data-urn*='activity']",
-    "li.occludable-update",
-]
-
-# ── Post body text ──
 POST_TEXT_SELECTORS = [
     ".update-components-text span.break-words",
     ".update-components-text",
@@ -1387,28 +1349,23 @@ POST_TEXT_SELECTORS = [
     "div.feed-shared-update-v2__description",
     ".attributed-text-segment-list__content",
     "span.break-words",
-    # content search snippet
     ".reusable-search-simple-insight__text",
     ".entity-result__simple-insight-text",
     "p[class*='insight']",
 ]
 
-# ── Author name ──
 AUTHOR_NAME_SELECTORS = [
     ".update-components-actor__name span[aria-hidden='true']",
     ".update-components-actor__name",
     ".feed-shared-actor__name",
-    # content search author
     ".entity-result__title-text a",
     "span.entity-result__title-text",
     "a.app-aware-link[href*='/in/']",
 ]
 
-# ── Author profile URL ──
 AUTHOR_URL_SELECTORS = [
     "a.update-components-actor__container",
     "a.feed-shared-actor__container-link",
-    # content search
     ".entity-result__title-text a[href*='/in/']",
     "a[href*='/in/'][class*='result']",
     "a[href*='/in/']",
@@ -1416,11 +1373,6 @@ AUTHOR_URL_SELECTORS = [
 
 
 class FeedScanner:
-    """
-    Logs in to LinkedIn, scrolls the feed, and saves any post that contains
-    one or more of the configured keywords to linkedin_feed_posts.xlsx.
-    Runs independently from LinkedInBot — opens its own Chrome window.
-    """
 
     def __init__(
         self,
@@ -1435,7 +1387,7 @@ class FeedScanner:
         self.wait:   WebDriverWait    | None = None
         self._stop_flag  = False
         self.found_posts: list[dict] = []
-        self._seen_urns:  set[str]   = set()   # deduplicate within a session
+        self._seen_urns:  set[str]   = set()
 
     def request_stop(self):
         self._stop_flag = True
@@ -1443,15 +1395,11 @@ class FeedScanner:
     def _should_stop(self) -> bool:
         return self._stop_flag
 
-    # ─────────────────────────────────── delays
-
     def _delay(self, lo: float = 2.0, hi: float = 4.0):
         time.sleep(random.uniform(lo, hi))
 
     def _short(self):
         time.sleep(random.uniform(0.6, 1.2))
-
-    # ─────────────────────────────────── browser (same setup as LinkedInBot)
 
     def _setup_driver(self):
         opts = Options()
@@ -1472,15 +1420,12 @@ class FeedScanner:
             self.driver = webdriver.Chrome(service=service, options=opts)
         else:
             self.driver = webdriver.Chrome(options=opts)
-
         self.driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
         )
         self.wait = WebDriverWait(self.driver, 15)
         self.log("[INFO] Feed scanner browser launched.")
-
-    # ─────────────────────────────────── login (same as LinkedInBot)
 
     def _login(self) -> bool:
         self.log("[INFO] Logging in for feed scan...")
@@ -1521,29 +1466,57 @@ class FeedScanner:
         self.log("[ERROR] Login failed.")
         return False
 
-    # ─────────────────────────────────── post extraction
-
+    # ── CHANGE 5: _get_posts — broader selectors + debug logging + data-urn fallback ──
     def _get_posts(self) -> list:
-        time.sleep(1.5)
-        for sel in POST_CONTAINER_SELECTORS:
-            posts = self.driver.find_elements(By.CSS_SELECTOR, sel)
-            visible = [p for p in posts if p.is_displayed()]
-            if len(visible) >= 1:
+        time.sleep(2.0)
+
+        # Log a sample of <li> classes so you can spot the real selector if all fail
+        try:
+            sample_li = self.driver.find_elements(By.TAG_NAME, "li")[:6]
+            for el in sample_li:
+                cls = (el.get_attribute("class") or "").strip()
+                if cls:
+                    self.log(f"[DEBUG] <li> class sample: {cls[:100]}")
+        except Exception:
+            pass
+
+        updated_selectors = [
+            "li.reusable-search__result-container",
+            "li[class*='search-result']",
+            "div[data-urn*='activity']",
+            "div[data-urn*='ugcPost']",
+            "div[data-urn]",
+            "div[class*='feed-shared-update']",
+            "div[class*='occludable-update']",
+            "article",
+        ]
+
+        for sel in updated_selectors:
+            try:
+                posts = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                visible = [p for p in posts if p.is_displayed()]
+                if visible:
+                    self.log(f"[DEBUG] {len(visible)} posts found via: {sel}")
+                    return visible
+            except Exception:
+                continue
+
+        # Hard fallback — anything with a data-urn attribute is almost always a post
+        try:
+            all_urns = self.driver.find_elements(By.CSS_SELECTOR, "[data-urn]")
+            visible = [el for el in all_urns if el.is_displayed()]
+            if visible:
+                self.log(f"[DEBUG] data-urn fallback: {len(visible)} elements")
                 return visible
+        except Exception:
+            pass
+
+        self.log("[WARN] _get_posts: no post containers found on this page.")
         return []
 
-    # ─────────────────────────────────── search
-
     def _build_search_queries(self) -> list[str]:
-        """
-        Combine feed_keywords × job_roles to generate search queries.
-        e.g. keywords=["C2C","Contract"], roles=["ai engineer"]
-          → ["C2C ai engineer", "Contract ai engineer", "C2C", "Contract"]
-        Deduplicates and caps at 20 queries.
-        """
         keywords = [k.strip() for k in self.config.get("feed_keywords", []) if k.strip()]
         roles    = [r.strip() for r in self.config.get("job_roles", []) if r.strip()]
-
         queries: list[str] = []
         seen: set[str] = set()
 
@@ -1552,19 +1525,15 @@ class FeedScanner:
                 seen.add(q.lower())
                 queries.append(q)
 
-        # keyword + role combinations first (most specific)
         for kw in keywords:
             for role in roles:
                 _add(f"{kw} {role}")
-
-        # then keyword alone
         for kw in keywords:
             _add(kw)
 
         return queries[:20]
 
     def _navigate_to_search(self, query: str):
-        """Open LinkedIn post/content search for the given query."""
         encoded = query.replace(" ", "%20")
         url = (
             f"https://www.linkedin.com/search/results/content/"
@@ -1573,7 +1542,6 @@ class FeedScanner:
         self.log(f"[INFO] Searching posts: '{query}'")
         self.driver.get(url)
         self._delay(3, 5)
-        # Wait for results container
         try:
             WebDriverWait(self.driver, 12).until(
                 EC.presence_of_element_located(
@@ -1582,8 +1550,6 @@ class FeedScanner:
             )
         except TimeoutException:
             self.log(f"[WARN] Search results slow to load for '{query}'")
-
-    # ─────────────────────────────────── post helpers
 
     def _get_urn(self, post) -> str:
         for attr in ("data-urn", "data-id", "data-activity-urn"):
@@ -1626,7 +1592,6 @@ class FeedScanner:
         return ""
 
     def _get_post_text(self, post) -> str:
-        # Try dedicated text selectors
         for sel in POST_TEXT_SELECTORS:
             try:
                 t = post.find_element(By.CSS_SELECTOR, sel).text.strip()
@@ -1634,7 +1599,6 @@ class FeedScanner:
                     return t
             except NoSuchElementException:
                 continue
-        # Fallback: all text inside the card
         try:
             t = post.text.strip()
             if len(t) > 20:
@@ -1649,7 +1613,6 @@ class FeedScanner:
                 if kw.strip().lower() in lower]
 
     def _process_post(self, post, found_count: int) -> int:
-        """Extract data from one post element; save if keywords match. Returns new found_count."""
         try:
             urn = self._get_urn(post)
             if urn and urn in self._seen_urns:
@@ -1694,8 +1657,7 @@ class FeedScanner:
 
         return found_count
 
-    # ─────────────────────────────────── main run
-
+    # ── CHANGE 6: run() — waits for new posts to load in DOM after each scroll ──
     def run(self):
         try:
             self._setup_driver()
@@ -1706,7 +1668,6 @@ class FeedScanner:
             max_scrolls = int(self.config.get("feed_max_scrolls", 30))
             found_count = 0
 
-            # Distribute scrolls evenly across queries
             scrolls_per_query = max(3, max_scrolls // max(len(queries), 1))
 
             self.log(f"[INFO] {len(queries)} search queries | {scrolls_per_query} scrolls each")
@@ -1730,8 +1691,18 @@ class FeedScanner:
                             break
                         found_count = self._process_post(post, found_count)
 
+                    # Scroll down and wait until new posts actually appear in the DOM
                     self.driver.execute_script("window.scrollBy(0, window.innerHeight * 1.8);")
-                    self._delay(2.5, 4.5)
+                    try:
+                        before_count = len(self.driver.find_elements(
+                            By.CSS_SELECTOR, "[data-urn]"))
+                        WebDriverWait(self.driver, 6).until(
+                            lambda d: len(d.find_elements(
+                                By.CSS_SELECTOR, "[data-urn]")) > before_count
+                        )
+                    except TimeoutException:
+                        pass
+                    self._delay(2.0, 3.5)
 
             self.log(f"\n[DONE] Scan complete — {found_count} posts found across {len(queries)} searches")
             update_feed_excel(self.found_posts, self.log)
