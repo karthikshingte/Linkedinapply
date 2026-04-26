@@ -3,7 +3,7 @@ LinkedIn Easy Apply Automation - Main GUI Application
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 import json
 import os
 import threading
@@ -29,6 +29,8 @@ DEFAULT_CONFIG = {
     "headless": False,
     "date_posted": "Any Time",
     "experience_level": "Any",
+    # Chrome profile — set to your Chrome User Data folder to skip login
+    "chrome_profile_path": "",
     # Feed scanner
     "feed_keywords": ["C2C", "Contract", "W2", "Hiring", "Looking for"],
     "feed_max_scrolls": 30,
@@ -53,6 +55,8 @@ DEFAULT_CONFIG = {
         "portfolio_url":      "",
         "default_yes_no":     "Yes",
         "cover_letter":       "",
+        # Resume path — full path to your PDF or DOCX
+        "resume_path":        "",
     },
 }
 
@@ -68,12 +72,11 @@ class LinkedInApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("LinkedIn Easy Apply Bot")
-        self.root.geometry("880x680")
+        self.root.geometry("900x700")
         self.root.resizable(True, True)
 
         self.config = self._load_config()
 
-        # Separate queues so both bots can log simultaneously
         self.job_log_queue:  queue.Queue = queue.Queue()
         self.feed_log_queue: queue.Queue = queue.Queue()
 
@@ -83,7 +86,7 @@ class LinkedInApp:
         self.feed_thread:  threading.Thread | None = None
         self.is_running      = False
         self.feed_is_running = False
-        self._collect_only_mode = False   # True when "Collect Only" was pressed
+        self._collect_only_mode = False
 
         self._build_ui()
         self._poll_queues()
@@ -92,10 +95,17 @@ class LinkedInApp:
 
     def _load_config(self) -> dict:
         cfg = DEFAULT_CONFIG.copy()
+        cfg["form_answers"] = DEFAULT_CONFIG["form_answers"].copy()
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    cfg.update(json.load(f))
+                    saved = json.load(f)
+                    cfg.update(saved)
+                    # merge form_answers sub-dict
+                    if "form_answers" in saved:
+                        merged = DEFAULT_CONFIG["form_answers"].copy()
+                        merged.update(saved["form_answers"])
+                        cfg["form_answers"] = merged
             except Exception:
                 pass
         return cfg
@@ -110,22 +120,22 @@ class LinkedInApp:
             messagebox.showerror("Error", f"Could not save config:\n{e}")
 
     def _sync_config_from_ui(self):
-        """Push all UI values into self.config (shared with the running bot)."""
-        self.config["email"]             = self.email_var.get().strip()
-        self.config["password"]          = self.password_var.get()
-        self.config["location"]          = self.location_var.get().strip()
-        self.config["min_delay"]         = float(self.min_delay_var.get())
-        self.config["max_delay"]         = float(self.max_delay_var.get())
-        self.config["max_applications"]  = int(self.max_apps_var.get())
-        self.config["headless"]          = self.headless_var.get()
-        self.config["date_posted"]       = self.date_var.get()
-        self.config["experience_level"]  = self.exp_var.get()
-        self.config["strict_role_match"] = self.strict_role_var.get()
-        self.config["job_roles"]         = list(self.roles_lb.get(0, tk.END))
-        self.config["ignore_words"]      = list(self.ignore_lb.get(0, tk.END))
-        self.config["job_type_keywords"] = list(self.kw_lb.get(0, tk.END))
-        self.config["feed_keywords"]     = list(self.feed_kw_lb.get(0, tk.END))
-        self.config["feed_max_scrolls"]  = int(self.feed_scrolls_var.get())
+        self.config["email"]               = self.email_var.get().strip()
+        self.config["password"]            = self.password_var.get()
+        self.config["location"]            = self.location_var.get().strip()
+        self.config["min_delay"]           = float(self.min_delay_var.get())
+        self.config["max_delay"]           = float(self.max_delay_var.get())
+        self.config["max_applications"]    = int(self.max_apps_var.get())
+        self.config["headless"]            = self.headless_var.get()
+        self.config["date_posted"]         = self.date_var.get()
+        self.config["experience_level"]    = self.exp_var.get()
+        self.config["strict_role_match"]   = self.strict_role_var.get()
+        self.config["chrome_profile_path"] = self.chrome_profile_var.get().strip()
+        self.config["job_roles"]           = list(self.roles_lb.get(0, tk.END))
+        self.config["ignore_words"]        = list(self.ignore_lb.get(0, tk.END))
+        self.config["job_type_keywords"]   = list(self.kw_lb.get(0, tk.END))
+        self.config["feed_keywords"]       = list(self.feed_kw_lb.get(0, tk.END))
+        self.config["feed_max_scrolls"]    = int(self.feed_scrolls_var.get())
         self.config["form_answers"] = {
             "phone":              self.fa_phone.get().strip(),
             "years_experience":   self.fa_years.get().strip(),
@@ -146,15 +156,10 @@ class LinkedInApp:
             "portfolio_url":      self.fa_portfolio.get().strip(),
             "default_yes_no":     self.fa_default_yn.get(),
             "cover_letter":       self.fa_cover.get("1.0", tk.END).strip(),
+            "resume_path":        self.fa_resume.get().strip(),
         }
 
     def _apply_changes(self):
-        """
-        Push UI values into the shared config dict mid-run.
-        The running bot reads self.config dynamically on every action,
-        so delays and filters take effect on the very next job processed.
-        Role list / ignore list changes take effect at the start of the next role search.
-        """
         self._sync_config_from_ui()
         self.status_var.set("Changes applied — take effect on next action")
         self.root.after(3000, lambda: self.status_var.set(
@@ -164,27 +169,20 @@ class LinkedInApp:
     # ──────────────────────────────────────────── ui
 
     def _build_ui(self):
-        # Modern theme
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"),
-                         foreground="#1A237E")
+        style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"), foreground="#1A237E")
         style.configure("Sub.TLabel", font=("Segoe UI", 9), foreground="#666")
-        style.configure("StatNum.TLabel", font=("Segoe UI", 22, "bold"))
 
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        # ── Header ──
         hdr = ttk.Frame(self.root, padding=(14, 10, 14, 0))
         hdr.grid(row=0, column=0, sticky="ew")
-        ttk.Label(hdr, text="LinkedIn Easy Apply Bot",
-                  style="Header.TLabel").pack(side=tk.LEFT)
-        ttk.Label(hdr,
-                  text="  Collect → Apply  |  Form Auto-Fill  |  Feed Scanner",
+        ttk.Label(hdr, text="LinkedIn Easy Apply Bot", style="Header.TLabel").pack(side=tk.LEFT)
+        ttk.Label(hdr, text="  Collect → Apply  |  Form Auto-Fill  |  Feed Scanner",
                   style="Sub.TLabel").pack(side=tk.LEFT, padx=(10, 0))
 
-        # ── Notebook ──
         nb = ttk.Notebook(self.root, padding=4)
         nb.grid(row=1, column=0, sticky="nsew", padx=10, pady=(6, 0))
 
@@ -197,13 +195,12 @@ class LinkedInApp:
         self._tab_feed_scanner(nb)
         self._tab_logs(nb)
 
-        # ── Status bar ──
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(self.root, textvariable=self.status_var,
                   relief=tk.SUNKEN, anchor=tk.W, padding=(8, 3)).grid(
             row=2, column=0, sticky="ew", padx=10, pady=(4, 8))
 
-    # ── dashboard tab ─────────────────────────────────────────────
+    # ── dashboard tab ──────────────────────────────────────────────────────────
 
     def _tab_dashboard(self, nb):
         f = ttk.Frame(nb, padding=12)
@@ -211,7 +208,6 @@ class LinkedInApp:
         f.columnconfigure(0, weight=1)
         f.rowconfigure(3, weight=1)
 
-        # ── Action buttons ──
         btn_frame = ttk.LabelFrame(f, text="Controls", padding=(10, 6))
         btn_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
@@ -227,9 +223,7 @@ class LinkedInApp:
                                    command=self._stop, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 12))
 
-        ttk.Separator(btn_frame, orient=tk.VERTICAL).pack(
-            side=tk.LEFT, fill=tk.Y, padx=6)
-
+        ttk.Separator(btn_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(btn_frame, text="Apply Changes Now",
                    command=self._apply_changes).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(btn_frame, text="Save Config",
@@ -238,7 +232,6 @@ class LinkedInApp:
                                     font=("Segoe UI", 9, "bold"))
         self.apps_label.pack(side=tk.RIGHT, padx=(10, 0))
 
-        # ── Stats row ──
         stats = ttk.LabelFrame(f, text="Live Statistics", padding=10)
         stats.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         stats.columnconfigure((0, 1, 2, 3), weight=1)
@@ -256,12 +249,9 @@ class LinkedInApp:
         ]):
             box = ttk.Frame(stats)
             box.grid(row=0, column=col, padx=8, sticky="ew")
-            ttk.Label(box, text=lbl, foreground="#666",
-                      font=("Segoe UI", 9)).pack()
-            tk.Label(box, textvariable=var, font=("Segoe UI", 22, "bold"),
-                     fg=clr).pack()
+            ttk.Label(box, text=lbl, foreground="#666", font=("Segoe UI", 9)).pack()
+            tk.Label(box, textvariable=var, font=("Segoe UI", 22, "bold"), fg=clr).pack()
 
-        # ── Progress bar ──
         prog = ttk.Frame(f)
         prog.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         prog.columnconfigure(0, weight=1)
@@ -270,7 +260,6 @@ class LinkedInApp:
         self.phase_label = ttk.Label(prog, text="", foreground="#555")
         self.phase_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        # ── Mini activity log ──
         log_frame = ttk.LabelFrame(f, text="Activity Log", padding=4)
         log_frame.grid(row=3, column=0, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
@@ -284,7 +273,7 @@ class LinkedInApp:
                         ("DONE","#2E7D32"),("DEBUG","#999")]:
             self.dash_log.tag_config(tag, foreground=fg)
 
-    # ── settings tab ──────────────────────────────────────────────
+    # ── settings tab ──────────────────────────────────────────────────────────
 
     def _tab_settings(self, nb):
         frame = ttk.Frame(nb, padding=12)
@@ -295,7 +284,7 @@ class LinkedInApp:
         def section(lbl):
             nonlocal r
             ttk.Label(frame, text=lbl, font=("Helvetica", 10, "bold")).grid(
-                row=r, column=0, columnspan=2, sticky="w", pady=(8 if r else 0, 4))
+                row=r, column=0, columnspan=3, sticky="w", pady=(8 if r else 0, 4))
             r += 1
 
         def field(lbl, widget_fn):
@@ -306,23 +295,40 @@ class LinkedInApp:
 
         def sep():
             nonlocal r
-            ttk.Separator(frame).grid(row=r, column=0, columnspan=2, sticky="ew", pady=6)
+            ttk.Separator(frame).grid(row=r, column=0, columnspan=3, sticky="ew", pady=6)
             r += 1
 
         section("LinkedIn Credentials")
         self.email_var = tk.StringVar(value=self.config["email"])
         field("Email:", lambda r: ttk.Entry(frame, textvariable=self.email_var, width=45).grid(
-            row=r, column=1, sticky="ew"))
+            row=r, column=1, columnspan=2, sticky="ew"))
 
         self.password_var = tk.StringVar(value=self.config["password"])
         field("Password:", lambda r: ttk.Entry(frame, textvariable=self.password_var,
-              show="*", width=45).grid(row=r, column=1, sticky="ew"))
+              show="*", width=45).grid(row=r, column=1, columnspan=2, sticky="ew"))
+
+        sep(); section("Chrome Profile (skip login & CAPTCHA)")
+
+        # Chrome profile path with browse button
+        self.chrome_profile_var = tk.StringVar(value=self.config.get("chrome_profile_path", ""))
+        ttk.Label(frame, text="Chrome User Data Dir:").grid(row=r, column=0, sticky="w", pady=3)
+        ttk.Entry(frame, textvariable=self.chrome_profile_var, width=38).grid(
+            row=r, column=1, sticky="ew", padx=(0, 4))
+        ttk.Button(frame, text="Browse…",
+                   command=self._browse_chrome_profile).grid(row=r, column=2, sticky="w")
+        r += 1
+        ttk.Label(frame,
+                  text="e.g. C:\\Users\\YourName\\AppData\\Local\\Google\\Chrome\\User Data\n"
+                       "When set the bot opens your existing logged-in Chrome session — no login needed.",
+                  foreground="#0277BD", wraplength=500, justify=tk.LEFT).grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        r += 1
 
         sep(); section("Search Settings")
 
         self.location_var = tk.StringVar(value=self.config["location"])
         field("Location:", lambda r: ttk.Entry(frame, textvariable=self.location_var, width=45).grid(
-            row=r, column=1, sticky="ew"))
+            row=r, column=1, columnspan=2, sticky="ew"))
 
         self.date_var = tk.StringVar(value=self.config["date_posted"])
         field("Date Posted:", lambda r: ttk.Combobox(frame, textvariable=self.date_var,
@@ -347,15 +353,20 @@ class LinkedInApp:
               from_=1, to=60, increment=0.5, width=8).grid(row=r, column=1, sticky="w"))
 
         ttk.Label(frame, text="Tip: click 'Apply Changes Now' to push new delays to a running bot.",
-                  foreground="#0277BD").grid(row=r, column=0, columnspan=2, sticky="w", pady=(2, 0))
+                  foreground="#0277BD").grid(row=r, column=0, columnspan=3, sticky="w", pady=(2, 0))
         r += 1
 
         sep(); section("Options")
         self.headless_var = tk.BooleanVar(value=self.config["headless"])
         ttk.Checkbutton(frame, text="Headless mode (browser runs hidden)",
-                        variable=self.headless_var).grid(row=r, column=0, columnspan=2, sticky="w")
+                        variable=self.headless_var).grid(row=r, column=0, columnspan=3, sticky="w")
 
-    # ── job roles tab ─────────────────────────────────────────────
+    def _browse_chrome_profile(self):
+        path = filedialog.askdirectory(title="Select Chrome User Data Directory")
+        if path:
+            self.chrome_profile_var.set(path)
+
+    # ── job roles tab ──────────────────────────────────────────────────────────
 
     def _tab_roles(self, nb):
         frame = ttk.Frame(nb, padding=12)
@@ -374,7 +385,7 @@ class LinkedInApp:
                       lambda: self._add_to(self.roles_lb, self.role_entry),
                       lambda: self._remove_from(self.roles_lb))
 
-    # ── ignore list tab ───────────────────────────────────────────
+    # ── ignore list tab ────────────────────────────────────────────────────────
 
     def _tab_ignore(self, nb):
         frame = ttk.Frame(nb, padding=12)
@@ -393,7 +404,7 @@ class LinkedInApp:
                       lambda: self._add_to(self.ignore_lb, self.ignore_entry),
                       lambda: self._remove_from(self.ignore_lb))
 
-    # ── filters tab ───────────────────────────────────────────────
+    # ── filters tab ────────────────────────────────────────────────────────────
 
     def _tab_filters(self, nb):
         frame = ttk.Frame(nb, padding=12)
@@ -415,7 +426,9 @@ class LinkedInApp:
         kw_box.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         kw_box.columnconfigure(0, weight=1)
         ttk.Label(kw_box,
-                  text="At least one keyword must appear in title or description. Leave empty = no filter.",
+                  text="At least one keyword must appear in the job description.\n"
+                       "When set, Phase 1 reads the side panel to pre-filter — saving Phase 2 time.\n"
+                       "Leave empty = no filter.",
                   foreground="#444").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
         sug = ttk.Frame(kw_box)
         sug.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 6))
@@ -435,7 +448,7 @@ class LinkedInApp:
                       lambda: self._add_to(self.kw_lb, self.kw_entry),
                       lambda: self._remove_from(self.kw_lb))
 
-    # ── form answers tab ──────────────────────────────────────────
+    # ── form answers tab ───────────────────────────────────────────────────────
 
     def _tab_form_answers(self, nb):
         outer = ttk.Frame(nb, padding=0)
@@ -455,11 +468,9 @@ class LinkedInApp:
         def _on_resize(e):
             canvas.itemconfig(frame_id, width=e.width)
         canvas.bind("<Configure>", _on_resize)
-
         frame.bind("<Configure>",
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
-        # Mouse-wheel scroll
         def _scroll(e):
             canvas.yview_scroll(-1 * (e.delta // 120), "units")
         canvas.bind_all("<MouseWheel>", _scroll)
@@ -477,17 +488,17 @@ class LinkedInApp:
 
         def section(lbl):
             nonlocal r
-            ttk.Separator(frame).grid(row=r, column=0, columnspan=2, sticky="ew", pady=(10, 4))
+            ttk.Separator(frame).grid(row=r, column=0, columnspan=3, sticky="ew", pady=(10, 4))
             r += 1
             ttk.Label(frame, text=lbl, font=("Helvetica", 10, "bold")).grid(
-                row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
+                row=r, column=0, columnspan=3, sticky="w", pady=(0, 4))
             r += 1
 
         def entry_row(lbl, var, show=""):
             nonlocal r
             ttk.Label(frame, text=lbl).grid(row=r, column=0, sticky="w", pady=3, padx=(0, 10))
             ttk.Entry(frame, textvariable=var, show=show, width=38).grid(
-                row=r, column=1, sticky="ew")
+                row=r, column=1, columnspan=2, sticky="ew")
             r += 1
 
         def combo_row(lbl, var, values):
@@ -498,94 +509,97 @@ class LinkedInApp:
             r += 1
 
         ttk.Label(frame,
-                  text="These answers are used to auto-fill prerequisite questions in Easy Apply forms.\n"
-                       "Leave a field blank to skip filling it.",
+                  text="These answers auto-fill Easy Apply forms.\nLeave a field blank to skip it.",
                   foreground="#444", wraplength=500, justify=tk.LEFT).grid(
-            row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
+            row=r, column=0, columnspan=3, sticky="w", pady=(0, 4))
         r += 1
 
-        # ── Contact ──────────────────────────────────────
+        # ── Resume ────────────────────────────────────────────────────────────
+        section("Resume File (auto-uploaded to any file input in Easy Apply)")
+        ttk.Label(frame, text="Resume Path (PDF/DOCX):").grid(
+            row=r, column=0, sticky="w", pady=3, padx=(0, 10))
+        self.fa_resume = tk.StringVar(value=fa.get("resume_path", ""))
+        ttk.Entry(frame, textvariable=self.fa_resume, width=32).grid(
+            row=r, column=1, sticky="ew", padx=(0, 4))
+        ttk.Button(frame, text="Browse…",
+                   command=self._browse_resume).grid(row=r, column=2, sticky="w")
+        r += 1
+        ttk.Label(frame, text="The bot detects file upload inputs and sends your resume automatically.",
+                  foreground="#0277BD").grid(row=r, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        r += 1
+
+        # ── Contact ───────────────────────────────────────────────────────────
         section("Contact Info")
         self.fa_phone = tk.StringVar(value=fa.get("phone", ""))
         entry_row("Phone Number:", self.fa_phone)
-
         self.fa_city  = tk.StringVar(value=fa.get("city", ""))
         entry_row("City:", self.fa_city)
-
         self.fa_state = tk.StringVar(value=fa.get("state", ""))
         entry_row("State / Province:", self.fa_state)
-
         self.fa_zip   = tk.StringVar(value=fa.get("zip_code", ""))
         entry_row("Zip / Postal Code:", self.fa_zip)
-
         self.fa_country = tk.StringVar(value=fa.get("country", "United States"))
         entry_row("Country:", self.fa_country)
 
-        # ── Experience ────────────────────────────────────
+        # ── Experience ────────────────────────────────────────────────────────
         section("Experience & Work Authorization")
-
         self.fa_years = tk.StringVar(value=fa.get("years_experience", "2"))
-        entry_row("Years of Experience  (used for any 'years of exp' question):", self.fa_years)
-
+        entry_row("Years of Experience:", self.fa_years)
         self.fa_education = tk.StringVar(value=fa.get("education_level", "Bachelor's Degree"))
         combo_row("Highest Education Level:", self.fa_education, EDU_LEVELS)
-
         self.fa_exp_level = tk.StringVar(value=fa.get("exp_level_label", "Entry level"))
         combo_row("Experience Level (dropdowns):", self.fa_exp_level, EXP_LEVELS)
-
         self.fa_work_auth = tk.StringVar(value=fa.get("authorized_to_work", "Yes"))
         combo_row("Authorized to work in the US?", self.fa_work_auth, YES_NO)
-
         self.fa_sponsorship = tk.StringVar(value=fa.get("require_sponsorship", "No"))
         combo_row("Require visa sponsorship?", self.fa_sponsorship, YES_NO)
-
         self.fa_relocate = tk.StringVar(value=fa.get("willing_to_relocate", "No"))
         combo_row("Willing to relocate?", self.fa_relocate, YES_NO)
-
         self.fa_work_pref = tk.StringVar(value=fa.get("work_preference", "Remote"))
-        combo_row("Work preference (Remote/Hybrid/On-site)?", self.fa_work_pref, WORK_PREF)
-
+        combo_row("Work preference?", self.fa_work_pref, WORK_PREF)
         self.fa_work_type = tk.StringVar(value=fa.get("work_type", "Full-time"))
         combo_row("Employment type (dropdowns):", self.fa_work_type, WORK_TYPES)
 
-        # ── Compensation ─────────────────────────────────
+        # ── Compensation ──────────────────────────────────────────────────────
         section("Compensation")
-
         self.fa_salary = tk.StringVar(value=fa.get("expected_salary", ""))
-        entry_row("Expected Annual Salary ($ numbers only):", self.fa_salary)
-
+        entry_row("Expected Annual Salary (numbers only):", self.fa_salary)
         self.fa_rate = tk.StringVar(value=fa.get("expected_rate", ""))
-        entry_row("Expected Hourly Rate ($ numbers only):", self.fa_rate)
+        entry_row("Expected Hourly Rate (numbers only):", self.fa_rate)
 
-        # ── Links ─────────────────────────────────────────
+        # ── Links ─────────────────────────────────────────────────────────────
         section("Profile Links")
-
         self.fa_linkedin = tk.StringVar(value=fa.get("linkedin_url", ""))
         entry_row("LinkedIn Profile URL:", self.fa_linkedin)
-
         self.fa_portfolio = tk.StringVar(value=fa.get("portfolio_url", ""))
         entry_row("GitHub / Portfolio URL:", self.fa_portfolio)
 
-        # ── Defaults ─────────────────────────────────────
+        # ── Defaults ──────────────────────────────────────────────────────────
         section("Fallback Behaviour")
-
         self.fa_default_yn = tk.StringVar(value=fa.get("default_yes_no", "Yes"))
         combo_row("Default answer for unknown Yes/No questions:", self.fa_default_yn, YES_NO)
 
-        # ── Cover Letter ──────────────────────────────────
+        # ── Cover Letter ──────────────────────────────────────────────────────
         section("Cover Letter (optional)")
-        ttk.Label(frame, text="Pasted into any cover letter / additional info text box.\n"
-                              "Leave blank to skip.", foreground="#555").grid(
-            row=r, column=0, columnspan=2, sticky="w")
+        ttk.Label(frame, text="Pasted into any cover letter text box. Leave blank to skip.",
+                  foreground="#555").grid(row=r, column=0, columnspan=3, sticky="w")
         r += 1
         self.fa_cover = tk.Text(frame, height=6, wrap=tk.WORD, font=("Consolas", 9))
-        self.fa_cover.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.fa_cover.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         cover_text = fa.get("cover_letter", "")
         if cover_text:
             self.fa_cover.insert("1.0", cover_text)
         r += 1
 
-    # ── feed scanner tab ──────────────────────────────────────────
+    def _browse_resume(self):
+        path = filedialog.askopenfilename(
+            title="Select Resume File",
+            filetypes=[("Resume files", "*.pdf *.docx *.doc"), ("All files", "*.*")]
+        )
+        if path:
+            self.fa_resume.set(path)
+
+    # ── feed scanner tab ───────────────────────────────────────────────────────
 
     def _tab_feed_scanner(self, nb):
         frame = ttk.Frame(nb, padding=12)
@@ -593,28 +607,23 @@ class LinkedInApp:
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(2, weight=1)
 
-        # Keywords
         kw_box = ttk.LabelFrame(frame, text="Keywords to find in feed posts", padding=10)
         kw_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         kw_box.columnconfigure(0, weight=1)
-
         ttk.Label(kw_box,
                   text="Any post containing at least one keyword will be saved to linkedin_feed_posts.xlsx.",
                   foreground="#444").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-
         sug = ttk.Frame(kw_box)
         sug.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         ttk.Label(sug, text="Quick add: ").pack(side=tk.LEFT)
         for kw in SUGGESTED_FEED_KW:
             ttk.Button(sug, text=kw, width=len(kw)+1,
                        command=lambda k=kw: self._quick_add(self.feed_kw_lb, k)).pack(side=tk.LEFT, padx=2)
-
         kw_box.rowconfigure(2, weight=1)
         self.feed_kw_lb, _ = self._make_listbox(kw_box, row=2)
         self.feed_kw_lb.configure(height=6)
         for kw in self.config.get("feed_keywords", []):
             self.feed_kw_lb.insert(tk.END, kw)
-
         self.feed_kw_entry = ttk.Entry(kw_box, width=30)
         self.feed_kw_entry.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         self.feed_kw_entry.bind("<Return>", lambda _: self._add_to(self.feed_kw_lb, self.feed_kw_entry))
@@ -622,7 +631,6 @@ class LinkedInApp:
                       lambda: self._add_to(self.feed_kw_lb, self.feed_kw_entry),
                       lambda: self._remove_from(self.feed_kw_lb))
 
-        # Options row
         opt = ttk.Frame(frame)
         opt.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(opt, text="Max scrolls through feed:").pack(side=tk.LEFT)
@@ -632,7 +640,6 @@ class LinkedInApp:
         ttk.Label(opt, text="(each scroll loads ~3–5 more posts)",
                   foreground="#666").pack(side=tk.LEFT)
 
-        # Feed log
         self.feed_log_text = scrolledtext.ScrolledText(
             frame, wrap=tk.WORD, state=tk.DISABLED, font=("Consolas", 9), height=10)
         self.feed_log_text.grid(row=2, column=0, sticky="nsew")
@@ -640,7 +647,6 @@ class LinkedInApp:
                         ("ERROR","#B71C1C"),("FOUND","#6A1B9A"),("DONE","#2E7D32"),("DEBUG","#999")]:
             self.feed_log_text.tag_config(tag, foreground=fg)
 
-        # Feed controls
         feed_ctrl = ttk.Frame(frame)
         feed_ctrl.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         self.feed_start_btn = ttk.Button(feed_ctrl, text="Scan Feed Now",
@@ -651,10 +657,11 @@ class LinkedInApp:
         self.feed_stop_btn.pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(feed_ctrl, text="Clear Log",
                    command=self._clear_feed_log).pack(side=tk.LEFT, padx=(0, 6))
-        self.feed_found_label = ttk.Label(feed_ctrl, text="Found: 0", font=("Helvetica", 9, "bold"))
+        self.feed_found_label = ttk.Label(feed_ctrl, text="Found: 0",
+                                          font=("Helvetica", 9, "bold"))
         self.feed_found_label.pack(side=tk.RIGHT)
 
-    # ── logs tab ──────────────────────────────────────────────────
+    # ── logs tab ───────────────────────────────────────────────────────────────
 
     def _tab_logs(self, nb):
         frame = ttk.Frame(nb, padding=12)
@@ -733,8 +740,6 @@ class LinkedInApp:
         widget.insert(tk.END, full, tag)
         widget.see(tk.END)
         widget.config(state=tk.DISABLED)
-
-        # Mirror job-bot messages to the Dashboard mini-log
         if kind == "job":
             self.dash_log.config(state=tk.NORMAL)
             self.dash_log.insert(tk.END, full, tag)
@@ -755,8 +760,12 @@ class LinkedInApp:
 
     def _start(self, collect_only: bool = False):
         self._sync_config_from_ui()
-        if not self.config["email"] or not self.config["password"]:
-            messagebox.showerror("Missing credentials", "Enter your LinkedIn email and password.")
+        # Allow starting without email/password if Chrome profile is set
+        has_profile = bool(self.config.get("chrome_profile_path", "").strip())
+        if not has_profile and (not self.config["email"] or not self.config["password"]):
+            messagebox.showerror("Missing credentials",
+                                 "Enter your LinkedIn email and password,\n"
+                                 "or set a Chrome Profile path in Settings.")
             return
         if not self.config["job_roles"]:
             messagebox.showerror("No job roles", "Add at least one job role to search for.")
@@ -771,7 +780,6 @@ class LinkedInApp:
         self.collect_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
 
-        # Reset dashboard stats for a fresh run
         self._stat_collected.set("0")
         self._stat_applied.set("0")
         self._stat_failed.set("0")
@@ -780,7 +788,6 @@ class LinkedInApp:
         self.progress.config(mode="indeterminate", value=0)
         self.phase_label.config(text="Starting…")
 
-        # Clear dashboard mini-log
         self.dash_log.config(state=tk.NORMAL)
         self.dash_log.delete("1.0", tk.END)
         self.dash_log.config(state=tk.DISABLED)
@@ -792,8 +799,6 @@ class LinkedInApp:
             self.status_var.set("Phase 1 — Collecting jobs…")
             self.apps_label.config(text="Collected: 0 | Applied: 0")
 
-        # Bot receives self.config BY REFERENCE — Apply Changes Now just updates
-        # this same dict, and the bot reads it dynamically on every action.
         self.bot = LinkedInBot(self.config, self._log_job,
                                self._on_collect_update, self._on_apply_update)
         self.bot_thread = threading.Thread(target=self._run_bot, daemon=True)
@@ -813,10 +818,7 @@ class LinkedInApp:
         self.status_var.set("Stopping…")
         self.stop_btn.config(state=tk.DISABLED)
 
-    # ── count callbacks (called from bot thread → schedule on main thread) ──
-
     def _on_collect_update(self, collected: int):
-        """Called by the bot each time a job is added to the collected list."""
         def _update():
             if self._collect_only_mode:
                 self.apps_label.config(text=f"Collected: {collected}")
@@ -825,7 +827,6 @@ class LinkedInApp:
                 applied_part = cur.split("|")[1].strip() if "|" in cur else "Applied: 0"
                 self.apps_label.config(text=f"Collected: {collected} | {applied_part}")
             self.status_var.set(f"Phase 1 — Collecting jobs… ({collected} so far)")
-            # Dashboard stats
             self._stat_collected.set(str(collected))
             self.phase_label.config(text="Phase 1 — Collecting job listings…")
             self.progress.config(mode="indeterminate")
@@ -833,13 +834,11 @@ class LinkedInApp:
         self.root.after(0, _update)
 
     def _on_apply_update(self, applied: int, total: int):
-        """Called by the bot each time an application succeeds/fails in Phase 2."""
         def _update():
             cur = self.apps_label.cget("text")
             collected_part = cur.split("|")[0].strip() if "|" in cur else "Collected: ?"
             self.apps_label.config(text=f"{collected_part} | Applied: {applied}/{total}")
             self.status_var.set(f"Phase 2 — Applying… ({applied}/{total})")
-            # Dashboard stats & progress
             self._stat_applied.set(str(applied))
             if self.bot:
                 self._stat_failed.set(str(len(self.bot.failed_jobs)))
@@ -855,10 +854,7 @@ class LinkedInApp:
         self.start_btn.config(state=tk.NORMAL)
         self.collect_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-
-        # Stop the indeterminate progress animation if still running
         self.progress.stop()
-
         if self.bot:
             self._stat_applied.set(str(self.bot.applied_count))
             self._stat_failed.set(str(len(self.bot.failed_jobs)))
@@ -866,7 +862,6 @@ class LinkedInApp:
             total = self.bot._total_to_apply or 1
             self.progress.config(mode="determinate", maximum=total,
                                  value=self.bot.applied_count)
-
         if self._collect_only_mode:
             self.status_var.set("Collect phase complete — check linkedin_jobs.xlsx")
             self.phase_label.config(text="✔ Collection finished")
@@ -883,8 +878,11 @@ class LinkedInApp:
 
     def _start_feed_scan(self):
         self._sync_config_from_ui()
-        if not self.config["email"] or not self.config["password"]:
-            messagebox.showerror("Missing credentials", "Enter your LinkedIn email and password.")
+        has_profile = bool(self.config.get("chrome_profile_path", "").strip())
+        if not has_profile and (not self.config["email"] or not self.config["password"]):
+            messagebox.showerror("Missing credentials",
+                                 "Enter your LinkedIn email and password,\n"
+                                 "or set a Chrome Profile path in Settings.")
             return
         if not self.config.get("feed_keywords"):
             messagebox.showerror("No keywords", "Add at least one keyword to search for in the feed.")

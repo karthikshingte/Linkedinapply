@@ -368,6 +368,17 @@ class LinkedInBot:
         opts = Options()
         if self.config.get("headless", False):
             opts.add_argument("--headless=new")
+
+        # ── Chrome profile: reuse your existing logged-in session ──
+        # Set chrome_profile_path in Settings to your Chrome user data directory
+        # e.g. C:\Users\YourName\AppData\Local\Google\Chrome\User Data
+        # When set, the bot skips login entirely and never hits CAPTCHA.
+        chrome_profile = self.config.get("chrome_profile_path", "").strip()
+        if chrome_profile:
+            opts.add_argument(f"--user-data-dir={chrome_profile}")
+            opts.add_argument("--profile-directory=Default")
+            self.log(f"[INFO] Using Chrome profile: {chrome_profile}")
+
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--disable-blink-features=AutomationControlled")
@@ -394,6 +405,15 @@ class LinkedInBot:
     # ─────────────────────────────────── login
 
     def _login(self) -> bool:
+        # If a Chrome profile is set, check if already logged in and skip login
+        if self.config.get("chrome_profile_path", "").strip():
+            self.driver.get("https://www.linkedin.com/feed/")
+            time.sleep(3)
+            if any(k in self.driver.current_url for k in ("feed", "mynetwork", "jobs")):
+                self.log("[INFO] Already logged in via Chrome profile — skipping login.")
+                return True
+            self.log("[INFO] Chrome profile set but not logged in — proceeding with login.")
+
         self.log("[INFO] Opening LinkedIn login page...")
         self.driver.get("https://www.linkedin.com/login")
         self._delay(2, 4)
@@ -527,10 +547,63 @@ class LinkedInBot:
             pass
         return ""
 
+    def _get_side_panel_text(self) -> str:
+        """
+        Read the job description from the RIGHT-SIDE detail panel that appears
+        when a card is clicked in the search results page.
+        This avoids a full driver.get() navigation — much faster for Phase 1 filtering.
+        Uses JS scan so it survives LinkedIn class-name changes.
+        """
+        time.sleep(1.8)   # let the panel finish loading after card click
+
+        # Try known panel container selectors first
+        PANEL_SELECTORS = [
+            "div.jobs-search__job-details--wrapper",
+            "div.scaffold-layout__detail",
+            "div[class*='jobs-search__job-details']",
+            "div[class*='job-details']",
+            "div.jobs-details",
+            "section[class*='jobs-details']",
+        ]
+        best_css = ""
+        for sel in PANEL_SELECTORS:
+            try:
+                text = self.driver.find_element(By.CSS_SELECTOR, sel).text.strip()
+                if len(text) > len(best_css):
+                    best_css = text
+            except Exception:
+                continue
+
+        if len(best_css) > 200:
+            return best_css.lower()
+
+        # JS fallback — find the element with the most text on the right half
+        # of the viewport (the detail panel is always on the right in split-pane)
+        try:
+            js_text = self.driver.execute_script("""
+                var vw = window.innerWidth;
+                var candidates = document.querySelectorAll('div, section, article');
+                var best = '';
+                for (var i = 0; i < candidates.length; i++) {
+                    var el = candidates[i];
+                    var rect = el.getBoundingClientRect();
+                    // Right-half panel: starts past the midpoint of the viewport
+                    if (rect.left < vw * 0.4) continue;
+                    if (el.children.length > 40) continue;
+                    var t = (el.innerText || '').trim();
+                    if (t.length > 200 && t.length > best.length) best = t;
+                }
+                return best;
+            """) or ""
+            if len(js_text) > 200:
+                return js_text.lower()
+        except Exception:
+            pass
+
+        return ""
+
     def _get_detail_text(self) -> str:
         """
-        Read the full 'About the job' description.
-
         Strategy (most robust → least):
           1. CSS selectors with wildcards (survive class-name changes)
           2. JavaScript scan — finds the div/section with the most text on the page
@@ -1093,10 +1166,89 @@ class LinkedInBot:
         except Exception:
             pass
 
-    def _fill_form_fields(self):
+    def _fill_typeahead_inputs(self, answers: dict):
+        """
+        Handle LinkedIn's autocomplete / combobox inputs — these are NOT standard
+        <select> elements. They use role='combobox' or aria-autocomplete='list'.
+        Examples: location fields, industry dropdowns, skill tags.
+        """
+        try:
+            combos = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "input[role='combobox'], input[aria-autocomplete='list'], "
+                "input[aria-autocomplete='both']"
+            )
+            for inp in combos:
+                try:
+                    if not inp.is_displayed() or not inp.is_enabled():
+                        continue
+                    current = (inp.get_attribute("value") or "").strip()
+                    if current:
+                        continue   # already filled
+                    label = self._get_label_text(inp)
+                    value = self._map_answer(label, answers)
+                    if not value:
+                        continue
+                    inp.clear()
+                    inp.send_keys(value)
+                    time.sleep(1.0)   # wait for suggestions to appear
+                    # Try clicking the first suggestion in the dropdown
+                    try:
+                        suggestion = WebDriverWait(self.driver, 3).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR,
+                                "div[role='option'], li[role='option'], "
+                                ".basic-typeahead__selectable, "
+                                "div[class*='autocomplete'] li"))
+                        )
+                        suggestion.click()
+                        time.sleep(0.5)
+                    except Exception:
+                        # No dropdown — just press Enter to confirm
+                        inp.send_keys(Keys.RETURN)
+                        time.sleep(0.3)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _upload_resume(self):
+        """
+        Auto-upload your resume if the form has a file input.
+        Set resume_path in config to the full path of your PDF/DOCX.
+        """
+        resume_path = self.config.get("resume_path", "").strip()
+        if not resume_path:
+            return
+        if not os.path.exists(resume_path):
+            self.log(f"[WARN] Resume file not found: {resume_path}")
+            return
+        try:
+            file_inputs = self.driver.find_elements(
+                By.CSS_SELECTOR, "input[type='file']")
+            for inp in file_inputs:
+                try:
+                    # Make hidden file inputs visible so Selenium can interact
+                    self.driver.execute_script(
+                        "arguments[0].style.display='block';"
+                        "arguments[0].style.visibility='visible';", inp)
+                    inp.send_keys(resume_path)
+                    time.sleep(2.0)   # wait for upload progress
+                    self.log(f"[INFO] Resume uploaded: {os.path.basename(resume_path)}")
+                    return   # upload to first file input only
+                except Exception:
+                    continue
+        except Exception as e:
+            self.log(f"[WARN] Resume upload failed: {e}")
+
+    def _fill_form_fields(self, is_first_step: bool = False):
+        """Fill all empty fields on the current form step."""
         answers = self.config.get("form_answers", {})
         try:
+            # Upload resume on the first step only (avoids re-uploading every page)
+            if is_first_step:
+                self._upload_resume()
             self._fill_text_inputs(answers)
+            self._fill_typeahead_inputs(answers)   # combobox / autocomplete inputs
             self._fill_selects(answers)
             self._fill_radio_groups(answers)
             self._fill_textareas(answers)
@@ -1111,7 +1263,7 @@ class LinkedInBot:
                 return False, "stopped by user"
 
             self._delay(1, 2)
-            self._fill_form_fields()
+            self._fill_form_fields(is_first_step=(step == 0))
             self._short()
 
             if self._click_submit():
@@ -1179,9 +1331,21 @@ class LinkedInBot:
     # ─────────────────────────────────── Phase 1 — collect
 
     def _collect_phase(self) -> list[dict]:
+        """
+        Fast collection pass — reads card metadata and, when job_type_keywords
+        are configured, clicks each card to read the side-panel description and
+        pre-filters BEFORE adding to the collected list.
+
+        This means Phase 2 only visits jobs that already passed the keyword filter —
+        no more wasting 20+ seconds per job just to skip it.
+        """
         collected: list[dict] = []
         seen_ids:  set[str]   = set()
         roles = self.config.get("job_roles", [])
+        # Only do the side-panel click when keywords are actually configured
+        pre_filter = bool(self.config.get("job_type_keywords"))
+        if pre_filter:
+            self.log("[INFO] Keyword pre-filter ON — will click each card to read description.")
 
         for role in roles:
             if self._should_stop():
@@ -1228,6 +1392,27 @@ class LinkedInBot:
                         if not self._check_role_match(title):
                             self.log(f"[SKIP] Off-role: {title}")
                             continue
+
+                        # ── Pre-filter by description keyword (Phase 1) ──
+                        # Click the card → read side panel → check keywords.
+                        # Saves Phase 2 from navigating to jobs that will be skipped.
+                        if pre_filter:
+                            try:
+                                self.driver.execute_script(
+                                    "arguments[0].scrollIntoView({block:'center'});", card)
+                                self._short()
+                                card.click()
+                                panel_text = self._get_side_panel_text()
+                                type_ok, type_why = self._check_job_type(title, panel_text)
+                                if not type_ok:
+                                    self.log(f"[SKIP] Keyword pre-filter ('{type_why}'): {title}")
+                                    continue
+                                else:
+                                    self.log(f"[DEBUG] Keyword matched in side panel: {title}")
+                            except StaleElementReferenceException:
+                                break
+                            except Exception as e:
+                                self.log(f"[WARN] Side panel read error: {e} — will check in Phase 2")
 
                         collected.append({
                             "title":        title,
